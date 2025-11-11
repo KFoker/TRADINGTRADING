@@ -2976,8 +2976,89 @@ class ProfessionalPositionManager:
                 position_ticket = order_ticket
 
             # 使用 OrderModify 设置止盈止损
+            # 获取实际持仓信息，使用实际入场价格重新验证止盈止损
+            positions = mt5.positions_get(symbol=symbol)
+            actual_entry_price = entry_price
+            if positions:
+                for pos in positions:
+                    if pos.ticket == position_ticket:
+                        actual_entry_price = pos.price_open
+                        # 使用实际入场价格重新验证和调整止盈止损
+                        point = symbol_info.point
+                        stops_level = 0
+                        try:
+                            if hasattr(symbol_info, 'trade_stops_level'):
+                                stops_level = symbol_info.trade_stops_level
+                            elif hasattr(symbol_info, 'stops_level'):
+                                stops_level = symbol_info.stops_level
+                        except:
+                            pass
+
+                        if stops_level <= 0:
+                            current_spread = (symbol_info.ask - symbol_info.bid) / point
+                            stops_level = max(2, int(current_spread * 2))
+
+                        logger.debug(
+                            f"验证止盈止损: 入场价={actual_entry_price:.2f}, 方向={signal['direction']}, 最小距离={stops_level}点")
+
+                        # 重新验证止损
+                        if sl_price > 0:
+                            if signal['direction'] == 'BUY':
+                                sl_distance = (actual_entry_price - sl_price) / point
+                                if sl_price >= actual_entry_price or sl_distance < stops_level:
+                                    old_sl = sl_price
+                                    sl_price = actual_entry_price - stops_level * point
+                                    sl_price = round(sl_price / point) * point
+                                    logger.debug(f"调整止损: {old_sl:.2f} -> {sl_price:.2f} (距离: {stops_level}点)")
+                            else:  # SELL
+                                sl_distance = (sl_price - actual_entry_price) / point
+                                if sl_price <= actual_entry_price or sl_distance < stops_level:
+                                    old_sl = sl_price
+                                    sl_price = actual_entry_price + stops_level * point
+                                    sl_price = round(sl_price / point) * point
+                                    logger.debug(f"调整止损: {old_sl:.2f} -> {sl_price:.2f} (距离: {stops_level}点)")
+
+                            # 最终验证止损方向
+                            if signal['direction'] == 'BUY' and sl_price >= actual_entry_price:
+                                logger.warning(f"⚠️ 止损价格无效（BUY订单止损应低于入场价），跳过设置止损")
+                                sl_price = 0
+                            elif signal['direction'] == 'SELL' and sl_price <= actual_entry_price:
+                                logger.warning(f"⚠️ 止损价格无效（SELL订单止损应高于入场价），跳过设置止损")
+                                sl_price = 0
+
+                        # 重新验证止盈
+                        if tp_price > 0:
+                            if signal['direction'] == 'BUY':
+                                tp_distance = (tp_price - actual_entry_price) / point
+                                if tp_price <= actual_entry_price or tp_distance < stops_level:
+                                    old_tp = tp_price
+                                    tp_price = actual_entry_price + stops_level * point
+                                    tp_price = round(tp_price / point) * point
+                                    logger.debug(f"调整止盈: {old_tp:.2f} -> {tp_price:.2f} (距离: {stops_level}点)")
+                            else:  # SELL
+                                tp_distance = (actual_entry_price - tp_price) / point
+                                if tp_price >= actual_entry_price or tp_distance < stops_level:
+                                    old_tp = tp_price
+                                    tp_price = actual_entry_price - stops_level * point
+                                    tp_price = round(tp_price / point) * point
+                                    logger.debug(f"调整止盈: {old_tp:.2f} -> {tp_price:.2f} (距离: {stops_level}点)")
+
+                            # 最终验证止盈方向
+                            if signal['direction'] == 'BUY' and tp_price <= actual_entry_price:
+                                logger.warning(f"⚠️ 止盈价格无效（BUY订单止盈应高于入场价），跳过设置止盈")
+                                tp_price = 0
+                            elif signal['direction'] == 'SELL' and tp_price >= actual_entry_price:
+                                logger.warning(f"⚠️ 止盈价格无效（SELL订单止盈应低于入场价），跳过设置止盈")
+                                tp_price = 0
+
+                        logger.debug(f"最终止盈止损: SL={sl_price:.2f}, TP={tp_price:.2f}")
+                        break
 
             # 只设置有效的止损和止盈
+            if sl_price == 0 and tp_price == 0:
+                logger.warning(f"⚠️ 止损和止盈都无效，跳过设置")
+                self.daily_trades += 1
+                return order_ticket
 
             modify_request = {
 
@@ -2995,6 +3076,7 @@ class ProfessionalPositionManager:
             if tp_price > 0:
                 modify_request["tp"] = tp_price
 
+            logger.debug(f"发送止盈止损设置请求: {modify_request}")
             modify_result = mt5.order_send(modify_request)
 
             if modify_result is None:
@@ -3402,6 +3484,65 @@ class ProfessionalPositionManager:
             if not symbol_info:
                 return
 
+            # 获取当前持仓信息
+            positions = mt5.positions_get(symbol=self.data_engine.symbol)
+            if not positions:
+                logger.warning(f"⚠️ 未找到持仓 {ticket}")
+                return
+
+            position = None
+            for pos in positions:
+                if pos.ticket == ticket:
+                    position = pos
+                    break
+
+            if not position:
+                logger.warning(f"⚠️ 未找到持仓 {ticket}")
+                return
+
+            # 获取最小止损距离
+            point = symbol_info.point
+            stops_level = 0
+            try:
+                if hasattr(symbol_info, 'trade_stops_level'):
+                    stops_level = symbol_info.trade_stops_level
+                elif hasattr(symbol_info, 'stops_level'):
+                    stops_level = symbol_info.stops_level
+            except:
+                pass
+
+            if stops_level <= 0:
+                current_spread = (symbol_info.ask - symbol_info.bid) / point
+                stops_level = max(2, int(current_spread * 2))
+
+            # 验证止盈价格
+            entry_price = position.price_open
+            position_type = 'BUY' if position.type == mt5.ORDER_TYPE_BUY else 'SELL'
+
+            # 计算止盈距离
+            if position_type == 'BUY':
+                tp_distance = (new_tp - entry_price) / point
+                # BUY订单：止盈应高于入场价，且距离至少为stops_level
+                if new_tp <= entry_price:
+                    logger.warning(f"⚠️ 止盈价格无效（BUY订单止盈应高于入场价 {entry_price:.2f}），跳过更新")
+                    return
+                if tp_distance < stops_level:
+                    # 调整止盈价格
+                    new_tp = entry_price + stops_level * point
+                    new_tp = round(new_tp / point) * point
+                    logger.debug(f"调整止盈价格以满足最小距离要求: {stops_level}点")
+            else:  # SELL
+                tp_distance = (entry_price - new_tp) / point
+                # SELL订单：止盈应低于入场价，且距离至少为stops_level
+                if new_tp >= entry_price:
+                    logger.warning(f"⚠️ 止盈价格无效（SELL订单止盈应低于入场价 {entry_price:.2f}），跳过更新")
+                    return
+                if tp_distance < stops_level:
+                    # 调整止盈价格
+                    new_tp = entry_price - stops_level * point
+                    new_tp = round(new_tp / point) * point
+                    logger.debug(f"调整止盈价格以满足最小距离要求: {stops_level}点")
+
             request = {
 
                 "action": mt5.TRADE_ACTION_SLTP,
@@ -3416,17 +3557,23 @@ class ProfessionalPositionManager:
 
             result = mt5.order_send(request)
 
-            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            if result is None:
+                error_code = mt5.last_error()
+                logger.warning(f"⚠️ 更新止盈价格失败: order_send返回None，错误代码: {error_code[0]} - {error_code[1]}")
+                return
+
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
 
                 logger.debug(f"✅ 止盈价格已更新: {ticket} -> {new_tp:.2f}")
 
-            elif result:
+            else:
 
                 logger.warning(f"⚠️ 更新止盈价格失败: {result.retcode} - {result.comment}")
 
         except Exception as e:
 
-            logger.debug(f"更新止盈价格异常: {str(e)}")
+            logger.error(f"更新止盈价格异常: {str(e)}")
+            traceback.print_exc()
 
 
 class ProfessionalComplexStrategy:
