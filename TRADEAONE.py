@@ -240,7 +240,7 @@ class ProfessionalComplexConfig:
 
         'CONFIRMATION_REQUIRED': 2,  # 降低要求
 
-        'MIN_STRENGTH': 0.5,
+        'MIN_STRENGTH': 0.35,  # 降低阈值以捕捉更多交易机会
 
         'WEIGHT_SYSTEM': {
 
@@ -824,11 +824,13 @@ class ProfessionalTickDataEngine:
             tick = mt5.symbol_info_tick(self.symbol)
 
             if not tick:
+                # 静默返回False，避免日志过多
                 return False
 
             # 深度数据验证
 
             if not self._validate_tick_quality(tick):
+                # 静默返回False，避免日志过多
                 return False
 
             # 创建增强的Tick记录
@@ -856,7 +858,9 @@ class ProfessionalTickDataEngine:
 
         except Exception as e:
 
-            logger.error(f"处理Tick数据异常: {str(e)}")
+            # 只在关键异常时记录，避免日志过多
+            if self.data_quality['total_ticks'] % 100 == 0:  # 每100个tick记录一次异常
+                logger.warning(f"处理Tick数据异常 (已处理{self.data_quality['total_ticks']}个): {str(e)}")
 
             return False
 
@@ -1569,7 +1573,7 @@ class AdvancedMarketStateAnalyzer:
 
             # 多维度状态概率计算
 
-            state_probabilities = {
+            raw_probabilities = {
 
                 'TRENDING': self._calculate_trending_probability(indicators),
 
@@ -1581,15 +1585,100 @@ class AdvancedMarketStateAnalyzer:
 
             }
 
+            # 添加诊断日志（降低频率）
+            current_time = time.time()
+            if int(current_time) % 60 == 0:  # 每60秒记录一次原始概率
+                logger.info(f"🔍 原始概率: TRENDING={raw_probabilities['TRENDING']:.3f}, "
+                            f"RANGING={raw_probabilities['RANGING']:.3f}, "
+                            f"VOLATILE={raw_probabilities['VOLATILE']:.3f}, "
+                            f"UNCERTAIN={raw_probabilities['UNCERTAIN']:.3f}")
+
+            # 使用改进的归一化方法
+            # 如果所有原始概率都很低，直接使用原始概率（不进行softmax）
+            max_raw_prob = max(raw_probabilities.values())
+
+            if max_raw_prob > 0.1:
+                # 如果最高概率 > 0.1，使用softmax归一化
+                temperature = 1.2  # 降低温度参数，使分布更集中
+                exp_probs = {}
+                for state, prob in raw_probabilities.items():
+                    # 限制概率范围在0-1之间
+                    prob = max(0.0, min(1.0, prob))
+                    # 使用偏移，避免所有概率都很低时softmax失效
+                    exp_probs[state] = math.exp((prob + 0.1) / temperature)
+
+                sum_exp = sum(exp_probs.values())
+                if sum_exp > 0:
+                    state_probabilities = {k: v / sum_exp for k, v in exp_probs.items()}
+                else:
+                    # 如果所有概率都为0，使用均匀分布
+                    state_probabilities = {k: 0.25 for k in raw_probabilities.keys()}
+            else:
+                # 如果所有原始概率都很低，直接归一化原始概率（不使用softmax）
+                total_raw = sum(raw_probabilities.values())
+                if total_raw > 0:
+                    state_probabilities = {k: v / total_raw for k, v in raw_probabilities.items()}
+                else:
+                    # 如果所有概率都为0，使用均匀分布
+                    state_probabilities = {k: 0.25 for k in raw_probabilities.keys()}
+
             # 选择最可能的状态
 
             max_state = max(state_probabilities, key=state_probabilities.get)
 
             max_prob = state_probabilities[max_state]
 
-            # 状态转换逻辑
+            # 添加诊断日志（降低频率）
+            if int(current_time) % 60 == 0:  # 每60秒记录一次归一化后的概率
+                logger.info(f"🔍 归一化后概率: TRENDING={state_probabilities['TRENDING']:.3f}, "
+                            f"RANGING={state_probabilities['RANGING']:.3f}, "
+                            f"VOLATILE={state_probabilities['VOLATILE']:.3f}, "
+                            f"UNCERTAIN={state_probabilities['UNCERTAIN']:.3f}, "
+                            f"最高状态: {max_state} (概率: {max_prob:.3f})")
 
-            if max_prob > 0.6 and max_state != self.current_state:
+            # 状态转换逻辑 - 增强稳定性
+            min_state_duration = 10.0  # 增加到10秒，避免频繁切换
+            state_duration = time.time() - self.last_state_change
+
+            # 调整状态转换阈值（根据归一化后的概率范围调整）
+            # 如果使用softmax，概率会更分散；如果直接归一化，概率会更集中
+            state_change_threshold = 0.4  # 降低阈值，因为归一化后概率可能较低
+            current_state_prob = state_probabilities.get(self.current_state, 0)
+            prob_difference = max_prob - current_state_prob
+
+            # 计算第二高概率，确保新状态明显优于其他所有状态
+            sorted_probs = sorted(state_probabilities.values(), reverse=True)
+            second_max_prob = sorted_probs[1] if len(sorted_probs) > 1 else 0
+            prob_advantage = max_prob - second_max_prob  # 与第二高概率的差值
+
+            # 增强的转换条件：
+            # 1. 新状态概率 > 阈值（降低到0.4）
+            # 2. 新状态概率明显高于当前状态（差值 > 0.15，降低要求）
+            # 3. 当前状态持续时间 >= 最小持续时间（10秒）
+            # 4. 新状态概率必须明显高于其他所有状态（差值 > 0.10，降低要求）
+            # 特殊处理：如果当前状态是UNCERTAIN，降低转换要求
+            if self.current_state == 'UNCERTAIN':
+                # 从UNCERTAIN转换时，降低要求
+                min_state_duration_uncertain = 5.0  # UNCERTAIN状态只需持续5秒
+                prob_difference_threshold = 0.10  # 降低差值要求
+                prob_advantage_threshold = 0.05  # 降低优势要求
+                should_change = (
+                        max_prob > 0.3 and  # 降低阈值
+                        max_state != self.current_state and
+                        prob_difference > prob_difference_threshold and
+                        state_duration >= min_state_duration_uncertain and
+                        prob_advantage > prob_advantage_threshold
+                )
+            else:
+                should_change = (
+                        max_prob > state_change_threshold and
+                        max_state != self.current_state and
+                        prob_difference > 0.15 and  # 降低到0.15
+                        state_duration >= min_state_duration and  # 至少持续10秒
+                        prob_advantage > 0.10  # 降低到0.10
+                )
+
+            if should_change:
 
                 old_state = self.current_state
 
@@ -1613,17 +1702,35 @@ class AdvancedMarketStateAnalyzer:
 
                     'confidence': max_prob,
 
-                    'duration': self.state_duration
+                    'duration': state_duration
 
                 }
 
                 self.state_history.append(state_record)
 
-                logger.info(f"🔄 市场状态变更: {old_state} -> {max_state} (置信度: {max_prob:.2f})")
+                logger.info(
+                    f"🔄 市场状态变更: {old_state} -> {max_state} (置信度: {max_prob:.2f}, 持续时间: {state_duration:.1f}秒)")
+                logger.debug(f"   概率分布: TRENDING={state_probabilities['TRENDING']:.2f}, "
+                             f"RANGING={state_probabilities['RANGING']:.2f}, "
+                             f"VOLATILE={state_probabilities['VOLATILE']:.2f}, "
+                             f"UNCERTAIN={state_probabilities['UNCERTAIN']:.2f}")
 
             else:
 
-                self.state_duration = time.time() - self.last_state_change
+                self.state_duration = state_duration
+                # 无论状态是否变更，都要更新置信度为当前最高概率
+                self.state_confidence = max_prob
+
+                # 如果状态未变更，但概率接近，记录调试信息
+                if max_state != self.current_state:
+                    if prob_difference > 0.1:
+                        logger.debug(f"⏸️ 状态未变更: {self.current_state} (当前概率: {current_state_prob:.2f}, "
+                                     f"最高概率: {max_prob:.2f}, 差值: {prob_difference:.2f}, "
+                                     f"持续时间: {state_duration:.1f}秒, 优势: {prob_advantage:.2f})")
+                    # 如果当前状态是UNCERTAIN，且最高概率明显高于UNCERTAIN，降低转换要求
+                    elif self.current_state == 'UNCERTAIN' and max_prob > 0.3:
+                        logger.info(f"🔄 检测到从UNCERTAIN转换到{max_state}的机会 (概率: {max_prob:.2f}, "
+                                    f"差值: {prob_difference:.2f}, 持续时间: {state_duration:.1f}秒)")
 
             return self.current_state, self.state_confidence
 
@@ -1710,7 +1817,7 @@ class AdvancedMarketStateAnalyzer:
 
     def _calculate_ranging_probability(self, indicators: Dict) -> float:
 
-        """计算震荡市概率"""
+        """计算震荡市概率 - 修复条件重叠问题"""
 
         probability = 0.0
 
@@ -1718,40 +1825,61 @@ class AdvancedMarketStateAnalyzer:
 
         try:
 
-            # 低波动率
-
+            # 低波动率 - 修复与VOLATILE的重叠问题
             atr_percent = indicators.get('ATR_PERCENT', 0)
+            atr_ranging_max = ProfessionalComplexConfig.MARKET_STATE_PARAMS['RANGING']['ATR_RATIO_MAX']
+            atr_volatile_min = ProfessionalComplexConfig.MARKET_STATE_PARAMS['VOLATILE']['ATR_RATIO_MIN']
 
-            if atr_percent < ProfessionalComplexConfig.MARKET_STATE_PARAMS['RANGING']['ATR_RATIO_MAX']:
-                low_vol_score = 1.0 - (
-
-                        atr_percent / ProfessionalComplexConfig.MARKET_STATE_PARAMS['RANGING']['ATR_RATIO_MAX'])
-
+            # 明确区分：RANGING要求ATR明显低于VOLATILE阈值
+            if atr_percent < atr_ranging_max:
+                # ATR在RANGING范围内
+                low_vol_score = 1.0 - (atr_percent / atr_ranging_max)
                 probability += low_vol_score * 0.30
-
                 weight_sum += 0.30
+            elif atr_percent > atr_volatile_min:
+                # ATR在VOLATILE范围内，降低RANGING概率
+                probability -= 0.20  # 负贡献
+                weight_sum += 0.20
+            else:
+                # ATR在中间区域（0.0004-0.0006），给予较低的RANGING概率
+                # 计算到RANGING阈值的距离
+                distance_to_ranging = (atr_percent - atr_ranging_max) / (atr_volatile_min - atr_ranging_max) if (
+                                                                                                                            atr_volatile_min - atr_ranging_max) > 0 else 0.5
+                low_vol_score = max(0.0, 1.0 - distance_to_ranging * 2)  # 距离越远，分数越低
+                probability += low_vol_score * 0.15  # 降低权重
+                weight_sum += 0.15
 
             # 布林带收缩
 
             bb_width = indicators.get('BB_WIDTH_RATIO', 0)
 
             if bb_width < ProfessionalComplexConfig.MARKET_STATE_PARAMS['RANGING']['BB_WIDTH_RATIO']:
+
                 bb_score = 1.0 - (bb_width / ProfessionalComplexConfig.MARKET_STATE_PARAMS['RANGING']['BB_WIDTH_RATIO'])
 
                 probability += bb_score * 0.25
 
                 weight_sum += 0.25
+            elif bb_width > 0.003:
+                # 布林带扩张，降低RANGING概率
+                probability -= 0.10
+                weight_sum += 0.10
 
             # ADX低值
 
             adx = indicators.get('ADX', 0)
 
             if adx < 20:
+
                 adx_score = 1.0 - (adx / 20.0)
 
                 probability += adx_score * 0.20
 
                 weight_sum += 0.20
+            else:
+                # ADX高值，降低RANGING概率
+                probability -= 0.10
+                weight_sum += 0.10
 
             # 价格震荡模式
 
@@ -1770,6 +1898,7 @@ class AdvancedMarketStateAnalyzer:
                                                                                                        recent_high + recent_low) > 0 else 0
 
                 if oscillation < ProfessionalComplexConfig.MARKET_STATE_PARAMS['RANGING']['PRICE_OSCILLATION']:
+
                     oscillation_score = 1.0 - (oscillation / ProfessionalComplexConfig.MARKET_STATE_PARAMS['RANGING'][
 
                         'PRICE_OSCILLATION'])
@@ -1777,8 +1906,19 @@ class AdvancedMarketStateAnalyzer:
                     probability += oscillation_score * 0.25
 
                     weight_sum += 0.25
+                else:
+                    # 震荡幅度大，降低RANGING概率
+                    probability -= 0.10
+                    weight_sum += 0.10
 
-            return probability / weight_sum if weight_sum > 0 else 0.0
+            # 限制概率范围在0-1之间，并归一化
+            if weight_sum > 0:
+                probability = probability / weight_sum
+                probability = max(0.0, min(1.0, probability))  # 限制在0-1之间
+            else:
+                probability = 0.0
+
+            return probability
 
         except Exception as e:
 
@@ -1788,7 +1928,7 @@ class AdvancedMarketStateAnalyzer:
 
     def _calculate_volatile_probability(self, indicators: Dict) -> float:
 
-        """计算高波动市概率"""
+        """计算高波动市概率 - 修复条件重叠问题"""
 
         probability = 0.0
 
@@ -1796,27 +1936,45 @@ class AdvancedMarketStateAnalyzer:
 
         try:
 
-            # 高波动率
-
+            # 高波动率 - 修复与RANGING的重叠问题
             atr_percent = indicators.get('ATR_PERCENT', 0)
+            atr_ranging_max = ProfessionalComplexConfig.MARKET_STATE_PARAMS['RANGING']['ATR_RATIO_MAX']
+            atr_volatile_min = ProfessionalComplexConfig.MARKET_STATE_PARAMS['VOLATILE']['ATR_RATIO_MIN']
 
-            if atr_percent > ProfessionalComplexConfig.MARKET_STATE_PARAMS['VOLATILE']['ATR_RATIO_MIN']:
+            # 明确区分：VOLATILE要求ATR明显高于RANGING阈值
+            if atr_percent > atr_volatile_min:
+                # ATR在VOLATILE范围内
                 high_vol_score = min(1.0, atr_percent / 0.001)
-
                 probability += high_vol_score * 0.35
-
                 weight_sum += 0.35
+            elif atr_percent < atr_ranging_max:
+                # ATR在RANGING范围内，降低VOLATILE概率
+                probability -= 0.25  # 负贡献
+                weight_sum += 0.25
+            else:
+                # ATR在中间区域（0.0004-0.0006），给予较低的VOLATILE概率
+                # 计算到VOLATILE阈值的距离
+                distance_to_volatile = (atr_volatile_min - atr_percent) / (atr_volatile_min - atr_ranging_max) if (
+                                                                                                                              atr_volatile_min - atr_ranging_max) > 0 else 0.5
+                high_vol_score = max(0.0, 1.0 - distance_to_volatile * 2)  # 距离越远，分数越低
+                probability += high_vol_score * 0.15  # 降低权重
+                weight_sum += 0.15
 
             # 布林带扩张
 
             bb_width = indicators.get('BB_WIDTH_RATIO', 0)
 
             if bb_width > 0.003:
+
                 width_score = min(1.0, bb_width / 0.005)
 
                 probability += width_score * 0.25
 
                 weight_sum += 0.25
+            elif bb_width < ProfessionalComplexConfig.MARKET_STATE_PARAMS['RANGING']['BB_WIDTH_RATIO']:
+                # 布林带收缩，降低VOLATILE概率
+                probability -= 0.15
+                weight_sum += 0.15
 
             # 价格大幅变动
 
@@ -1829,11 +1987,16 @@ class AdvancedMarketStateAnalyzer:
                     abs((prices[i] - prices[i - 1]) / prices[i - 1]) for i in range(1, min(10, len(prices))))
 
                 if max_change > ProfessionalComplexConfig.MARKET_STATE_PARAMS['VOLATILE']['PRICE_SPIKE_FREQUENCY']:
+
                     change_score = min(1.0, max_change / 0.005)
 
                     probability += change_score * 0.25
 
                     weight_sum += 0.25
+                else:
+                    # 价格变动小，降低VOLATILE概率
+                    probability -= 0.10
+                    weight_sum += 0.10
 
             # 成交量异常
 
@@ -1850,17 +2013,358 @@ class AdvancedMarketStateAnalyzer:
                     volume_spike = max(recent_volumes) / avg_volume
 
                     if volume_spike > ProfessionalComplexConfig.MARKET_STATE_PARAMS['VOLATILE']['VOLUME_SPIKE_RATIO']:
+
                         probability += 0.15
 
                         weight_sum += 0.15
+                    else:
+                        # 成交量正常，降低VOLATILE概率
+                        probability -= 0.05
+                        weight_sum += 0.05
 
-            return probability / weight_sum if weight_sum > 0 else 0.0
+            # 限制概率范围在0-1之间，并归一化
+            if weight_sum > 0:
+                probability = probability / weight_sum
+                probability = max(0.0, min(1.0, probability))  # 限制在0-1之间
+            else:
+                probability = 0.0
+
+            return probability
 
         except Exception as e:
 
             logger.warning(f"计算波动概率异常: {str(e)}")
 
             return 0.0
+
+
+class TechnicalPatternRecognizer:
+    """技术形态识别器 - 识别各种K线形态和价格模式"""
+
+    def __init__(self, data_engine: ProfessionalTickDataEngine):
+        self.data_engine = data_engine
+        self.pattern_cache = {}
+        self.last_pattern_check = 0
+
+    def detect_patterns(self, prices: List[float], highs: List[float], lows: List[float]) -> Dict[str, Any]:
+        """检测技术形态"""
+        if len(prices) < 20:
+            return {}
+
+        patterns = {}
+
+        # 1. 双顶/双底形态
+        double_pattern = self._detect_double_top_bottom(prices, highs, lows)
+        if double_pattern:
+            patterns.update(double_pattern)
+
+        # 2. 头肩顶/头肩底形态
+        head_shoulder = self._detect_head_shoulders(prices, highs, lows)
+        if head_shoulder:
+            patterns.update(head_shoulder)
+
+        # 3. 三角形形态（上升/下降/对称）
+        triangle = self._detect_triangle(prices, highs, lows)
+        if triangle:
+            patterns.update(triangle)
+
+        # 4. 旗形/矩形形态
+        flag_pattern = self._detect_flag_rectangle(prices, highs, lows)
+        if flag_pattern:
+            patterns.update(flag_pattern)
+
+        # 5. 支撑/阻力突破
+        support_resistance = self._detect_support_resistance_breakout(prices, highs, lows)
+        if support_resistance:
+            patterns.update(support_resistance)
+
+        # 6. 楔形形态
+        wedge = self._detect_wedge(prices, highs, lows)
+        if wedge:
+            patterns.update(wedge)
+
+        return patterns
+
+    def _detect_double_top_bottom(self, prices: List[float], highs: List[float], lows: List[float]) -> Optional[Dict]:
+        """检测双顶/双底形态"""
+        if len(highs) < 20 or len(lows) < 20:
+            return None
+
+        # 寻找两个相近的高点（双顶）或低点（双底）
+        recent_highs = highs[-20:]
+        recent_lows = lows[-20:]
+
+        # 双顶检测
+        if len(recent_highs) >= 10:
+            # 找到最高点和次高点
+            sorted_highs = sorted(enumerate(recent_highs), key=lambda x: x[1], reverse=True)
+            if len(sorted_highs) >= 2:
+                idx1, high1 = sorted_highs[0]
+                idx2, high2 = sorted_highs[1]
+
+                # 检查两个高点是否相近（差异<2%）
+                if abs(high1 - high2) / max(high1, high2) < 0.02 and abs(idx1 - idx2) >= 5:
+                    # 检查中间是否有明显的回撤
+                    mid_range = recent_highs[min(idx1, idx2):max(idx1, idx2) + 1]
+                    if mid_range:
+                        mid_low = min(mid_range)
+                        retracement = (max(high1, high2) - mid_low) / max(high1, high2)
+                        if retracement > 0.03:  # 回撤至少3%
+                            return {
+                                'DOUBLE_TOP': {
+                                    'type': 'BEARISH',
+                                    'strength': min(1.0, retracement * 10),
+                                    'resistance': max(high1, high2)
+                                }
+                            }
+
+        # 双底检测
+        if len(recent_lows) >= 10:
+            sorted_lows = sorted(enumerate(recent_lows), key=lambda x: x[1])
+            if len(sorted_lows) >= 2:
+                idx1, low1 = sorted_lows[0]
+                idx2, low2 = sorted_lows[1]
+
+                if abs(low1 - low2) / max(low1, low2) < 0.02 and abs(idx1 - idx2) >= 5:
+                    mid_range = recent_lows[min(idx1, idx2):max(idx1, idx2) + 1]
+                    if mid_range:
+                        mid_high = max(mid_range)
+                        retracement = (mid_high - min(low1, low2)) / min(low1, low2)
+                        if retracement > 0.03:
+                            return {
+                                'DOUBLE_BOTTOM': {
+                                    'type': 'BULLISH',
+                                    'strength': min(1.0, retracement * 10),
+                                    'support': min(low1, low2)
+                                }
+                            }
+
+        return None
+
+    def _detect_head_shoulders(self, prices: List[float], highs: List[float], lows: List[float]) -> Optional[Dict]:
+        """检测头肩顶/头肩底形态"""
+        if len(highs) < 15 or len(lows) < 15:
+            return None
+
+        recent_highs = highs[-15:]
+        recent_lows = lows[-15:]
+
+        # 头肩顶：左肩-头-右肩，头最高
+        if len(recent_highs) >= 10:
+            # 简化检测：寻找三个高点，中间最高
+            peaks = []
+            for i in range(1, len(recent_highs) - 1):
+                if recent_highs[i] > recent_highs[i - 1] and recent_highs[i] > recent_highs[i + 1]:
+                    peaks.append((i, recent_highs[i]))
+
+            if len(peaks) >= 3:
+                # 检查中间峰值是否最高
+                peaks_sorted = sorted(peaks, key=lambda x: x[1], reverse=True)
+                if len(peaks_sorted) >= 3:
+                    head_idx, head_high = peaks_sorted[0]
+                    # 检查左右肩是否相近且低于头
+                    shoulders = [p for p in peaks_sorted[1:] if abs(p[0] - head_idx) > 2]
+                    if len(shoulders) >= 2:
+                        left_shoulder = min(shoulders, key=lambda x: abs(x[0] - (head_idx - 5)))
+                        right_shoulder = min(shoulders, key=lambda x: abs(x[0] - (head_idx + 5)))
+                        if (head_high > left_shoulder[1] and head_high > right_shoulder[1] and
+                                abs(left_shoulder[1] - right_shoulder[1]) / max(left_shoulder[1],
+                                                                                right_shoulder[1]) < 0.03):
+                            return {
+                                'HEAD_SHOULDER_TOP': {
+                                    'type': 'BEARISH',
+                                    'strength': 0.7,
+                                    'neckline': (left_shoulder[1] + right_shoulder[1]) / 2
+                                }
+                            }
+
+        # 头肩底：左肩-头-右肩，头最低
+        if len(recent_lows) >= 10:
+            valleys = []
+            for i in range(1, len(recent_lows) - 1):
+                if recent_lows[i] < recent_lows[i - 1] and recent_lows[i] < recent_lows[i + 1]:
+                    valleys.append((i, recent_lows[i]))
+
+            if len(valleys) >= 3:
+                valleys_sorted = sorted(valleys, key=lambda x: x[1])
+                if len(valleys_sorted) >= 3:
+                    head_idx, head_low = valleys_sorted[0]
+                    shoulders = [v for v in valleys_sorted[1:] if abs(v[0] - head_idx) > 2]
+                    if len(shoulders) >= 2:
+                        left_shoulder = min(shoulders, key=lambda x: abs(x[0] - (head_idx - 5)))
+                        right_shoulder = min(shoulders, key=lambda x: abs(x[0] - (head_idx + 5)))
+                        if (head_low < left_shoulder[1] and head_low < right_shoulder[1] and
+                                abs(left_shoulder[1] - right_shoulder[1]) / max(left_shoulder[1],
+                                                                                right_shoulder[1]) < 0.03):
+                            return {
+                                'HEAD_SHOULDER_BOTTOM': {
+                                    'type': 'BULLISH',
+                                    'strength': 0.7,
+                                    'neckline': (left_shoulder[1] + right_shoulder[1]) / 2
+                                }
+                            }
+
+        return None
+
+    def _detect_triangle(self, prices: List[float], highs: List[float], lows: List[float]) -> Optional[Dict]:
+        """检测三角形形态（上升/下降/对称）"""
+        if len(highs) < 10 or len(lows) < 10:
+            return None
+
+        recent_highs = highs[-10:]
+        recent_lows = lows[-10:]
+
+        # 计算高点和低点的趋势
+        high_trend = (recent_highs[-1] - recent_highs[0]) / recent_highs[0] if recent_highs[0] > 0 else 0
+        low_trend = (recent_lows[-1] - recent_lows[0]) / recent_lows[0] if recent_lows[0] > 0 else 0
+
+        # 计算波动率收缩
+        early_range = max(recent_highs[:5]) - min(recent_lows[:5])
+        late_range = max(recent_highs[-5:]) - min(recent_lows[-5:])
+        contraction = (early_range - late_range) / early_range if early_range > 0 else 0
+
+        if contraction > 0.2:  # 波动率收缩至少20%
+            # 上升三角形：高点水平，低点上升
+            if abs(high_trend) < 0.01 and low_trend > 0.01:
+                return {
+                    'ASCENDING_TRIANGLE': {
+                        'type': 'BULLISH',
+                        'strength': min(1.0, contraction * 2),
+                        'resistance': max(recent_highs)
+                    }
+                }
+            # 下降三角形：低点水平，高点下降
+            elif abs(low_trend) < 0.01 and high_trend < -0.01:
+                return {
+                    'DESCENDING_TRIANGLE': {
+                        'type': 'BEARISH',
+                        'strength': min(1.0, contraction * 2),
+                        'support': min(recent_lows)
+                    }
+                }
+            # 对称三角形：高点和低点都收敛
+            elif abs(high_trend) < 0.015 and abs(low_trend) < 0.015:
+                return {
+                    'SYMMETRIC_TRIANGLE': {
+                        'type': 'NEUTRAL',
+                        'strength': min(1.0, contraction * 2),
+                        'breakout_direction': 'UNKNOWN'
+                    }
+                }
+
+        return None
+
+    def _detect_flag_rectangle(self, prices: List[float], highs: List[float], lows: List[float]) -> Optional[Dict]:
+        """检测旗形/矩形形态"""
+        if len(prices) < 15:
+            return None
+
+        recent_prices = prices[-15:]
+        recent_highs = highs[-15:]
+        recent_lows = lows[-15:]
+
+        # 矩形：价格在水平区间内震荡
+        price_range = max(recent_highs) - min(recent_lows)
+        avg_price = sum(recent_prices) / len(recent_prices)
+        range_ratio = price_range / avg_price if avg_price > 0 else 0
+
+        if range_ratio < 0.02:  # 窄幅震荡
+            # 检查是否有明显的趋势前导
+            if len(prices) >= 20:
+                prior_trend = (prices[-15] - prices[-20]) / prices[-20] if prices[-20] > 0 else 0
+                if abs(prior_trend) > 0.01:  # 有明显的前导趋势
+                    return {
+                        'FLAG_PATTERN': {
+                            'type': 'BULLISH' if prior_trend > 0 else 'BEARISH',
+                            'strength': 0.6,
+                            'continuation': True
+                        }
+                    }
+                else:
+                    return {
+                        'RECTANGLE': {
+                            'type': 'NEUTRAL',
+                            'strength': 0.5,
+                            'resistance': max(recent_highs),
+                            'support': min(recent_lows)
+                        }
+                    }
+
+        return None
+
+    def _detect_support_resistance_breakout(self, prices: List[float], highs: List[float], lows: List[float]) -> \
+    Optional[Dict]:
+        """检测支撑/阻力突破"""
+        if len(prices) < 20:
+            return None
+
+        recent_prices = prices[-20:]
+        recent_highs = highs[-20:]
+        recent_lows = lows[-20:]
+
+        current_price = recent_prices[-1]
+
+        # 识别关键支撑和阻力位
+        resistance = max(recent_highs[:-5])  # 排除最近5个点
+        support = min(recent_lows[:-5])
+
+        # 检查是否突破阻力
+        if current_price > resistance * 0.998:
+            breakout_strength = (current_price - resistance) / resistance if resistance > 0 else 0
+            if breakout_strength > 0.0005:  # 突破至少0.05%
+                return {
+                    'RESISTANCE_BREAKOUT': {
+                        'type': 'BULLISH',
+                        'strength': min(1.0, breakout_strength * 100),
+                        'resistance': resistance
+                    }
+                }
+
+        # 检查是否跌破支撑
+        if current_price < support * 1.002:
+            breakdown_strength = (support - current_price) / support if support > 0 else 0
+            if breakdown_strength > 0.0005:
+                return {
+                    'SUPPORT_BREAKDOWN': {
+                        'type': 'BEARISH',
+                        'strength': min(1.0, breakdown_strength * 100),
+                        'support': support
+                    }
+                }
+
+        return None
+
+    def _detect_wedge(self, prices: List[float], highs: List[float], lows: List[float]) -> Optional[Dict]:
+        """检测楔形形态"""
+        if len(highs) < 10 or len(lows) < 10:
+            return None
+
+        recent_highs = highs[-10:]
+        recent_lows = lows[-10:]
+
+        # 计算高点和低点的趋势
+        high_trend = (recent_highs[-1] - recent_highs[0]) / recent_highs[0] if recent_highs[0] > 0 else 0
+        low_trend = (recent_lows[-1] - recent_lows[0]) / recent_lows[0] if recent_lows[0] > 0 else 0
+
+        # 上升楔形：高点和低点都上升，但高点上升更快（看跌）
+        if high_trend > 0.01 and low_trend > 0.01 and high_trend > low_trend * 1.2:
+            return {
+                'RISING_WEDGE': {
+                    'type': 'BEARISH',
+                    'strength': 0.6
+                }
+            }
+
+        # 下降楔形：高点和低点都下降，但低点下降更快（看涨）
+        if high_trend < -0.01 and low_trend < -0.01 and abs(low_trend) > abs(high_trend) * 1.2:
+            return {
+                'FALLING_WEDGE': {
+                    'type': 'BULLISH',
+                    'strength': 0.6
+                }
+            }
+
+        return None
 
 
 class ProfessionalSignalGenerator:
@@ -1878,6 +2382,9 @@ class ProfessionalSignalGenerator:
 
         self.confirmation_count = 0
 
+        # 初始化技术形态识别器
+        self.pattern_recognizer = TechnicalPatternRecognizer(data_engine)
+
     def generate_trading_signal(self) -> Optional[Dict[str, Any]]:
 
         """生成交易信号"""
@@ -1890,16 +2397,23 @@ class ProfessionalSignalGenerator:
             # 检查信号间隔
 
             current_time = time.time()
+            min_interval = ProfessionalComplexConfig.SIGNAL_GENERATION['FILTERS']['MIN_TICKS_BETWEEN_SIGNALS']
 
-            if current_time - self.last_signal_time < ProfessionalComplexConfig.SIGNAL_GENERATION['FILTERS'][
-                'MIN_TICKS_BETWEEN_SIGNALS']:
+            if current_time - self.last_signal_time < min_interval:
+                # 静默返回，避免日志过多
                 return None
 
             # 获取市场状态
 
             market_state, state_confidence = self.market_analyzer.analyze_complex_market_state()
 
-            if state_confidence < 0.5:
+            # 降低置信度阈值，因为归一化后概率可能较低
+            confidence_threshold = 0.3  # 从0.5降低到0.3
+            if state_confidence < confidence_threshold:
+                # 记录为什么没有生成信号（降低频率）
+                if int(current_time) % 60 == 0:  # 每60秒记录一次
+                    logger.info(
+                        f"⏸️ 市场状态置信度不足: {market_state} (置信度: {state_confidence:.2f} < {confidence_threshold})，跳过信号生成")
                 return None
 
             # 获取技术指标
@@ -1907,6 +2421,9 @@ class ProfessionalSignalGenerator:
             indicators = self.data_engine.calculate_complex_indicators()
 
             if not indicators:
+                # 记录为什么没有生成信号（降低频率）
+                if int(current_time) % 60 == 0:  # 每60秒记录一次
+                    logger.warning(f"⚠️ 无法计算技术指标，跳过信号生成")
                 return None
 
             # 获取当前价格和点差
@@ -1938,21 +2455,49 @@ class ProfessionalSignalGenerator:
 
                 signal = self._generate_volatile_signal(indicators, current_price, spread)
 
-            if signal and signal['strength'] >= ProfessionalComplexConfig.SIGNAL_GENERATION['MIN_STRENGTH']:
-                signal['market_state'] = market_state
+            if signal:
+                if signal['strength'] >= ProfessionalComplexConfig.SIGNAL_GENERATION['MIN_STRENGTH']:
+                    signal['market_state'] = market_state
+                    signal['state_confidence'] = state_confidence
+                    signal['timestamp'] = current_time
+                    self.last_signal_time = current_time
+                    self.signal_history.append(signal)
+                    logger.info(
+                        f"📈 生成信号: {signal['direction']} 强度: {signal['strength']:.2f} 价格: {current_price:.2f}")
+                    return signal
+                else:
+                    # 记录信号强度不足（降低频率）
+                    if int(current_time) % 60 == 0:  # 每60秒记录一次
+                        logger.info(f"⏸️ 信号强度不足: {signal.get('direction', 'UNKNOWN')} "
+                                    f"强度: {signal['strength']:.2f} < {ProfessionalComplexConfig.SIGNAL_GENERATION['MIN_STRENGTH']}")
+            else:
+                # 记录为什么没有生成信号（降低频率，添加详细诊断信息）
+                if int(current_time) % 60 == 0:  # 每60秒记录一次
+                    # 添加详细的诊断信息
+                    try:
+                        ema_alignment = indicators.get('EMA_ALIGNMENT', 'N/A')
+                        macd_trend = indicators.get('MACD_TREND', 'N/A')
+                        adx = indicators.get('ADX', 'N/A')
+                        rsi_14 = indicators.get('RSI_14', 'N/A')
+                        atr_percent = indicators.get('ATR_PERCENT', 'N/A')
 
-                signal['state_confidence'] = state_confidence
-
-                signal['timestamp'] = current_time
-
-                self.last_signal_time = current_time
-
-                self.signal_history.append(signal)
-
-                logger.info(
-                    f"📈 生成信号: {signal['direction']} 强度: {signal['strength']:.2f} 价格: {current_price:.2f}")
-
-                return signal
+                        if market_state == 'TRENDING':
+                            logger.info(f"⏸️ TRENDING状态未生成信号 - 诊断: EMA={ema_alignment}, "
+                                        f"MACD={macd_trend}, ADX={adx}, RSI={rsi_14}, ATR%={atr_percent}")
+                        elif market_state == 'RANGING':
+                            stoch_k = indicators.get('STOCH_K', 'N/A')
+                            bb_position = indicators.get('BB_POSITION', 'N/A')
+                            logger.info(f"⏸️ RANGING状态未生成信号 - 诊断: RSI={rsi_14}, "
+                                        f"StochK={stoch_k}, BB位置={bb_position}")
+                        elif market_state == 'VOLATILE':
+                            bb_upper = indicators.get('BB_UPPER_2.0', 'N/A')
+                            bb_lower = indicators.get('BB_LOWER_2.0', 'N/A')
+                            logger.info(f"⏸️ VOLATILE状态未生成信号 - 诊断: 价格={current_price:.2f}, "
+                                        f"BB上轨={bb_upper}, BB下轨={bb_lower}, ATR%={atr_percent}")
+                        else:
+                            logger.info(f"⏸️ 市场状态 {market_state} 下未生成信号（可能条件不满足）")
+                    except:
+                        logger.info(f"⏸️ 市场状态 {market_state} 下未生成信号（可能条件不满足）")
 
             return None
 
@@ -1964,7 +2509,7 @@ class ProfessionalSignalGenerator:
 
     def _generate_trending_signal(self, indicators: Dict, current_price: float, spread: float) -> Optional[Dict]:
 
-        """生成趋势市信号"""
+        """生成趋势市信号 - 改进版：使用渐进式评分，更精准捕捉交易机会"""
 
         weights = ProfessionalComplexConfig.SIGNAL_GENERATION['WEIGHT_SYSTEM']['TRENDING']
 
@@ -1972,7 +2517,7 @@ class ProfessionalSignalGenerator:
 
         direction = 0  # 1=买入, -1=卖出
 
-        # 趋势指标分析
+        # 获取所有指标值
 
         ema_alignment = indicators.get('EMA_ALIGNMENT', 0)
 
@@ -1980,42 +2525,316 @@ class ProfessionalSignalGenerator:
 
         adx = indicators.get('ADX', 0)
 
-        if ema_alignment > 0.5 and macd_trend > 0.3 and adx > 20:
-
-            signal_score += weights['TREND_INDICATORS']
-
-            direction = 1
-
-        elif ema_alignment < -0.5 and macd_trend < -0.3 and adx > 20:
-
-            signal_score += weights['TREND_INDICATORS']
-
-            direction = -1
-
-        # 动量指标
-
         rsi_14 = indicators.get('RSI_14', 50)
 
         stoch_k = indicators.get('STOCH_K', 50)
 
-        if direction == 1:
-
-            if rsi_14 < 70 and stoch_k < 80:
-                signal_score += weights['MOMENTUM_INDICATORS'] * 0.5
-
-        elif direction == -1:
-
-            if rsi_14 > 30 and stoch_k > 20:
-                signal_score += weights['MOMENTUM_INDICATORS'] * 0.5
-
-        # 波动率确认
+        stoch_d = indicators.get('STOCH_D', 50)
 
         atr_percent = indicators.get('ATR_PERCENT', 0)
 
-        if 0.0001 < atr_percent < 0.001:
-            signal_score += weights['VOLATILITY_INDICATORS']
+        plus_di = indicators.get('PLUS_DI', 0)
+
+        minus_di = indicators.get('MINUS_DI', 0)
+
+        macd_hist = indicators.get('MACD_HIST', 0)
+
+        # 添加调试日志（每60秒输出一次）
+
+        current_time = time.time()
+
+        if int(current_time) % 60 == 0:
+            logger.info(f"🔍 TRENDING信号生成检查: EMA对齐={ema_alignment:.2f}, MACD趋势={macd_trend:.2f}, "
+
+                        f"ADX={adx:.1f}, RSI14={rsi_14:.1f}, StochK={stoch_k:.1f}, ATR%={atr_percent:.6f}")
+
+        # ========== 改进的趋势指标分析（渐进式评分） ==========
+
+        trend_score = 0.0
+
+        bullish_signals = 0
+
+        bearish_signals = 0
+
+        # 1. ADX基础要求（必须有趋势强度）
+
+        if adx > 20:
+
+            # 2. EMA排列分析（渐进式评分）
+
+            if ema_alignment > 0.3:  # 降低阈值，允许部分满足
+
+                trend_score += 0.08  # 部分满足给部分分数
+
+                bullish_signals += 1
+
+            if ema_alignment > 0.5:  # 完全满足再加分
+
+                trend_score += 0.07
+
+                bullish_signals += 1
+
+            elif ema_alignment < -0.3:  # 空头趋势
+
+                trend_score += 0.08
+
+                bearish_signals += 1
+
+            elif ema_alignment < -0.5:
+
+                trend_score += 0.07
+
+                bearish_signals += 1
+
+            # 3. MACD趋势分析（渐进式评分）
+
+            if macd_trend > 0.2:  # 降低阈值
+
+                trend_score += 0.08
+
+                bullish_signals += 1
+
+            if macd_trend > 0.3:  # 完全满足
+
+                trend_score += 0.07
+
+                bullish_signals += 1
+
+            elif macd_trend < -0.2:  # 空头
+
+                trend_score += 0.08
+
+                bearish_signals += 1
+
+            elif macd_trend < -0.3:
+
+                trend_score += 0.07
+
+                bearish_signals += 1
+
+            # 4. MACD柱状图确认
+
+            if macd_hist > 0 and macd_trend > 0:
+
+                trend_score += 0.05
+
+                bullish_signals += 1
+
+            elif macd_hist < 0 and macd_trend < 0:
+
+                trend_score += 0.05
+
+                bearish_signals += 1
+
+            # 5. DI指标确认
+
+            if plus_di > minus_di and plus_di > 20:
+
+                trend_score += 0.05
+
+                bullish_signals += 1
+
+            elif minus_di > plus_di and minus_di > 20:
+
+                trend_score += 0.05
+
+                bearish_signals += 1
+
+            # 归一化趋势分数到权重值
+
+            if trend_score > 0:
+
+                # 根据满足的信号数量调整权重
+
+                signal_multiplier = min(1.0, (bullish_signals + bearish_signals) / 3.0)
+
+                signal_score += trend_score * weights['TREND_INDICATORS'] / 0.35 * signal_multiplier
+
+                # 确定方向（基于信号数量）
+
+                if bullish_signals > bearish_signals:
+
+                    direction = 1
+
+                elif bearish_signals > bullish_signals:
+
+                    direction = -1
+
+                elif ema_alignment > 0 or macd_trend > 0:
+
+                    direction = 1
+
+                elif ema_alignment < 0 or macd_trend < 0:
+
+                    direction = -1
+
+        # ========== 改进的动量指标分析 ==========
+
+        if direction != 0:
+
+            momentum_score = 0.0
+
+            if direction == 1:  # 买入信号
+
+                # RSI不过度超买（允许更宽松的条件）
+
+                if rsi_14 < 75:  # 从70放宽到75
+
+                    momentum_score += 0.3
+
+                if rsi_14 < 60:  # 更理想的位置
+
+                    momentum_score += 0.2
+
+                # Stochastic确认
+
+                if stoch_k < 85:  # 从80放宽到85
+
+                    momentum_score += 0.3
+
+                if stoch_k < 70:  # 更理想的位置
+
+                    momentum_score += 0.2
+
+                # Stochastic金叉
+
+                if stoch_k > stoch_d and stoch_k < 80:
+                    momentum_score += 0.2
+
+            else:  # 卖出信号
+
+                # RSI不过度超卖
+
+                if rsi_14 > 25:  # 从30放宽到25
+
+                    momentum_score += 0.3
+
+                if rsi_14 > 40:  # 更理想的位置
+
+                    momentum_score += 0.2
+
+                # Stochastic确认
+
+                if stoch_k > 15:  # 从20放宽到15
+
+                    momentum_score += 0.3
+
+                if stoch_k > 30:  # 更理想的位置
+
+                    momentum_score += 0.2
+
+                # Stochastic死叉
+
+                if stoch_k < stoch_d and stoch_k > 20:
+                    momentum_score += 0.2
+
+            # 应用动量分数（归一化到权重）
+
+            if momentum_score > 0:
+                signal_score += (momentum_score / 1.0) * weights['MOMENTUM_INDICATORS']
+
+        # ========== 改进的波动率确认（放宽范围） ==========
+
+        volatility_score = 0.0
+
+        if 0.00005 < atr_percent < 0.002:  # 扩大范围
+
+            volatility_score = 1.0  # 完全满足
+
+        elif 0.0001 < atr_percent < 0.001:  # 原范围
+
+            volatility_score = 1.0
+
+        elif atr_percent > 0:  # 如果ATR存在但不在理想范围，给部分分数
+
+            # 根据ATR值给予部分分数
+
+            if 0.00005 <= atr_percent <= 0.0001:
+
+                volatility_score = 0.5  # 波动率偏低但可用
+
+            elif 0.001 <= atr_percent <= 0.002:
+
+                volatility_score = 0.7  # 波动率偏高但可用
+
+        if volatility_score > 0:
+            signal_score += volatility_score * weights['VOLATILITY_INDICATORS']
+
+        # ========== 价格行为确认（新增） ==========
+
+        if direction != 0:
+
+            prices = list(self.data_engine.price_buffer)
+
+            if len(prices) >= 5:
+
+                recent_momentum = (prices[-1] - prices[-5]) / prices[-5] if prices[-5] > 0 else 0
+
+                # 价格动量与信号方向一致
+
+                if (direction == 1 and recent_momentum > 0) or (direction == -1 and recent_momentum < 0):
+
+                    signal_score += weights.get('PRICE_ACTION', 0.10)
+
+                    # 如果动量很强，额外加分
+
+                    if abs(recent_momentum) > 0.001:
+                        signal_score += 0.05
+
+        # ========== 模式识别（新增） ==========
+
+        if direction != 0 and abs(ema_alignment) > 0.4:
+
+            # 如果多个指标高度一致，给予额外分数
+
+            consistency_bonus = 0.0
+
+            if direction == 1:
+
+                if ema_alignment > 0.4 and macd_trend > 0.2 and plus_di > minus_di:
+                    consistency_bonus = 0.05
+
+                    signal_score += consistency_bonus * weights.get('PATTERN_RECOGNITION', 0.10)
+
+            elif direction == -1:
+
+                if ema_alignment < -0.4 and macd_trend < -0.2 and minus_di > plus_di:
+                    consistency_bonus = 0.05
+
+                    signal_score += consistency_bonus * weights.get('PATTERN_RECOGNITION', 0.10)
+
+        # ========== 技术形态识别（新增） ==========
+        if direction != 0:
+            prices = list(self.data_engine.price_buffer)
+            highs = list(self.data_engine.high_buffer)
+            lows = list(self.data_engine.low_buffer)
+
+            if len(prices) >= 20 and len(highs) >= 20 and len(lows) >= 20:
+                patterns = self.pattern_recognizer.detect_patterns(prices, highs, lows)
+
+                for pattern_name, pattern_data in patterns.items():
+                    pattern_type = pattern_data.get('type', 'NEUTRAL')
+                    pattern_strength = pattern_data.get('strength', 0.5)
+
+                    # 检查形态方向是否与信号方向一致
+                    if (direction == 1 and pattern_type == 'BULLISH') or (
+                            direction == -1 and pattern_type == 'BEARISH'):
+                        # 形态确认信号，给予额外分数
+                        pattern_score = pattern_strength * weights.get('PATTERN_RECOGNITION', 0.10)
+                        signal_score += pattern_score
+
+                        if int(current_time) % 60 == 0:
+                            logger.info(
+                                f"🔍 检测到技术形态: {pattern_name} ({pattern_type}), 强度: {pattern_strength:.2f}, 加分: {pattern_score:.3f}")
+
+        # ========== 生成信号 ==========
 
         if signal_score > 0 and direction != 0:
+
+            if int(current_time) % 60 == 0:
+                logger.info(
+                    f"📊 TRENDING信号得分: {signal_score:.3f} (需要≥{ProfessionalComplexConfig.SIGNAL_GENERATION['MIN_STRENGTH']})")
+
             return {
 
                 'direction': 'BUY' if direction == 1 else 'SELL',
@@ -2032,7 +2851,7 @@ class ProfessionalSignalGenerator:
 
     def _generate_ranging_signal(self, indicators: Dict, current_price: float, spread: float) -> Optional[Dict]:
 
-        """生成震荡市信号"""
+        """生成震荡市信号 - 改进版：使用渐进式评分，捕捉更多反转机会"""
 
         weights = ProfessionalComplexConfig.SIGNAL_GENERATION['WEIGHT_SYSTEM']['RANGING']
 
@@ -2040,7 +2859,7 @@ class ProfessionalSignalGenerator:
 
         direction = 0
 
-        # 震荡指标分析
+        # 获取所有指标值
 
         rsi_14 = indicators.get('RSI_14', 50)
 
@@ -2050,33 +2869,251 @@ class ProfessionalSignalGenerator:
 
         williams = indicators.get('WILLIAMSR', -50)
 
-        # 超卖买入
-
-        if rsi_14 < 30 and stoch_k < 20 and williams < -80:
-
-            signal_score += weights['OSCILLATORS']
-
-            direction = 1
-
-        # 超买卖出
-
-        elif rsi_14 > 70 and stoch_k > 80 and williams > -20:
-
-            signal_score += weights['OSCILLATORS']
-
-            direction = -1
-
-        # 布林带位置
+        cci = indicators.get('CCI', 0)
 
         bb_position = indicators.get('BB_POSITION', 0.5)
 
-        if direction == 1 and bb_position < 0.2:
+        bb_upper = indicators.get('BB_UPPER_2.0', current_price)
 
-            signal_score += weights['SUPPORT_RESISTANCE'] * 0.5
+        bb_lower = indicators.get('BB_LOWER_2.0', current_price)
 
-        elif direction == -1 and bb_position > 0.8:
+        bb_middle = indicators.get('BB_UPPER_1.0', current_price)  # 使用1.0标准差作为中轨近似
 
-            signal_score += weights['SUPPORT_RESISTANCE'] * 0.5
+        # ========== 改进的震荡指标分析（渐进式评分） ==========
+
+        oscillator_score = 0.0
+
+        bullish_oscillators = 0
+
+        bearish_oscillators = 0
+
+        # 1. RSI分析（渐进式）
+
+        if rsi_14 < 35:  # 放宽超卖条件
+
+            oscillator_score += 0.15
+
+            bullish_oscillators += 1
+
+        if rsi_14 < 30:  # 完全超卖
+
+            oscillator_score += 0.15
+
+            bullish_oscillators += 1
+
+        elif rsi_14 > 65:  # 放宽超买条件
+
+            oscillator_score += 0.15
+
+            bearish_oscillators += 1
+
+        elif rsi_14 > 70:  # 完全超买
+
+            oscillator_score += 0.15
+
+            bearish_oscillators += 1
+
+        # 2. Stochastic分析（渐进式）
+
+        if stoch_k < 25:  # 放宽超卖条件
+
+            oscillator_score += 0.15
+
+            bullish_oscillators += 1
+
+        if stoch_k < 20:  # 完全超卖
+
+            oscillator_score += 0.15
+
+            bullish_oscillators += 1
+
+        elif stoch_k > 75:  # 放宽超买条件
+
+            oscillator_score += 0.15
+
+            bearish_oscillators += 1
+
+        elif stoch_k > 80:  # 完全超买
+
+            oscillator_score += 0.15
+
+            bearish_oscillators += 1
+
+        # 3. Stochastic交叉信号
+
+        if stoch_k > stoch_d and stoch_k < 30:  # 金叉且处于低位
+
+            oscillator_score += 0.1
+
+            bullish_oscillators += 1
+
+        elif stoch_k < stoch_d and stoch_k > 70:  # 死叉且处于高位
+
+            oscillator_score += 0.1
+
+            bearish_oscillators += 1
+
+        # 4. Williams %R分析
+
+        if williams < -75:  # 放宽超卖条件
+
+            oscillator_score += 0.1
+
+            bullish_oscillators += 1
+
+        if williams < -80:  # 完全超卖
+
+            oscillator_score += 0.1
+
+            bullish_oscillators += 1
+
+        elif williams > -25:  # 放宽超买条件
+
+            oscillator_score += 0.1
+
+            bearish_oscillators += 1
+
+        elif williams > -20:  # 完全超买
+
+            oscillator_score += 0.1
+
+            bearish_oscillators += 1
+
+        # 5. CCI分析（新增）
+
+        if cci < -100:  # 超卖
+
+            oscillator_score += 0.1
+
+            bullish_oscillators += 1
+
+        elif cci > 100:  # 超买
+
+            oscillator_score += 0.1
+
+            bearish_oscillators += 1
+
+        # 归一化震荡指标分数
+
+        if oscillator_score > 0:
+
+            signal_score += (oscillator_score / 1.0) * weights['OSCILLATORS']
+
+            # 确定方向
+
+            if bullish_oscillators > bearish_oscillators:
+
+                direction = 1
+
+            elif bearish_oscillators > bullish_oscillators:
+
+                direction = -1
+
+            elif rsi_14 < 50:
+
+                direction = 1
+
+            else:
+
+                direction = -1
+
+        # ========== 布林带位置分析（改进） ==========
+
+        if direction != 0:
+
+            support_resistance_score = 0.0
+
+            if direction == 1:  # 买入信号
+
+                if bb_position < 0.3:  # 放宽条件从0.2到0.3
+
+                    support_resistance_score += 0.5
+
+                if bb_position < 0.2:  # 完全满足
+
+                    support_resistance_score += 0.5
+
+                # 价格接近下轨
+
+                if current_price <= bb_lower * 1.002:
+                    support_resistance_score += 0.3
+
+            else:  # 卖出信号
+
+                if bb_position > 0.7:  # 放宽条件从0.8到0.7
+
+                    support_resistance_score += 0.5
+
+                if bb_position > 0.8:  # 完全满足
+
+                    support_resistance_score += 0.5
+
+                # 价格接近上轨
+
+                if current_price >= bb_upper * 0.998:
+                    support_resistance_score += 0.3
+
+            if support_resistance_score > 0:
+                signal_score += (support_resistance_score / 1.0) * weights['SUPPORT_RESISTANCE']
+
+        # ========== 价格模式识别（新增） ==========
+
+        if direction != 0:
+
+            prices = list(self.data_engine.price_buffer)
+
+            if len(prices) >= 10:
+
+                # 检查是否在震荡区间
+
+                recent_high = max(prices[-10:])
+
+                recent_low = min(prices[-10:])
+
+                price_range = (recent_high - recent_low) / ((recent_high + recent_low) / 2) if (
+                                                                                                           recent_high + recent_low) > 0 else 0
+
+                # 如果价格在区间内震荡，给予模式识别分数
+
+                if price_range < 0.002:  # 低波动，符合震荡市特征
+
+                    signal_score += weights.get('PRICE_PATTERNS', 0.15) * 0.5
+
+                # 检查价格是否在布林带中轨附近（震荡市特征）
+
+                if bb_middle > 0:
+
+                    distance_to_middle = abs(current_price - bb_middle) / bb_middle if bb_middle > 0 else 0
+
+                    if distance_to_middle < 0.001:  # 接近中轨
+
+                        signal_score += weights.get('PRICE_PATTERNS', 0.15) * 0.3
+
+        # ========== 技术形态识别（新增） ==========
+        if direction != 0:
+            prices = list(self.data_engine.price_buffer)
+            highs = list(self.data_engine.high_buffer)
+            lows = list(self.data_engine.low_buffer)
+
+            if len(prices) >= 20 and len(highs) >= 20 and len(lows) >= 20:
+                patterns = self.pattern_recognizer.detect_patterns(prices, highs, lows)
+
+                for pattern_name, pattern_data in patterns.items():
+                    pattern_type = pattern_data.get('type', 'NEUTRAL')
+                    pattern_strength = pattern_data.get('strength', 0.5)
+
+                    # 震荡市特别关注反转形态（双顶/双底、头肩等）
+                    if pattern_name in ['DOUBLE_TOP', 'DOUBLE_BOTTOM', 'HEAD_SHOULDER_TOP', 'HEAD_SHOULDER_BOTTOM']:
+                        if (direction == 1 and pattern_type == 'BULLISH') or (
+                                direction == -1 and pattern_type == 'BEARISH'):
+                            pattern_score = pattern_strength * weights.get('PRICE_PATTERNS', 0.15)
+                            signal_score += pattern_score
+                    # 矩形和旗形也给予分数
+                    elif pattern_name in ['RECTANGLE', 'FLAG_PATTERN']:
+                        pattern_score = pattern_strength * weights.get('PRICE_PATTERNS', 0.15) * 0.5
+                        signal_score += pattern_score
+
+        # ========== 生成信号 ==========
 
         if signal_score > 0 and direction != 0:
             return {
@@ -2095,7 +3132,7 @@ class ProfessionalSignalGenerator:
 
     def _generate_volatile_signal(self, indicators: Dict, current_price: float, spread: float) -> Optional[Dict]:
 
-        """生成高波动市信号"""
+        """生成高波动市信号 - 改进版：更精准捕捉突破机会"""
 
         weights = ProfessionalComplexConfig.SIGNAL_GENERATION['WEIGHT_SYSTEM']['VOLATILE']
 
@@ -2103,39 +3140,204 @@ class ProfessionalSignalGenerator:
 
         direction = 0
 
-        # 突破信号
+        # 获取所有指标值
 
         bb_upper = indicators.get('BB_UPPER_2.0', current_price)
 
         bb_lower = indicators.get('BB_LOWER_2.0', current_price)
 
-        if current_price > bb_upper * 0.999:
+        bb_upper_1 = indicators.get('BB_UPPER_1.0', current_price)
 
-            signal_score += weights['BREAKOUT_SIGNALS']
+        bb_lower_1 = indicators.get('BB_LOWER_1.0', current_price)
 
-            direction = 1
+        atr_percent = indicators.get('ATR_PERCENT', 0)
 
-        elif current_price < bb_lower * 1.001:
+        adx = indicators.get('ADX', 0)
 
-            signal_score += weights['BREAKOUT_SIGNALS']
-
-            direction = -1
-
-        # 价格行为确认
+        macd_hist = indicators.get('MACD_HIST', 0)
 
         prices = list(self.data_engine.price_buffer)
 
-        if len(prices) >= 5:
+        # ========== 改进的突破信号分析（渐进式评分） ==========
+
+        breakout_score = 0.0
+
+        # 1. 布林带突破（多层级）
+
+        if current_price > bb_upper * 0.998:  # 放宽条件
+
+            breakout_score += 0.4
+
+            direction = 1
+
+        if current_price > bb_upper:  # 完全突破
+
+            breakout_score += 0.6
+
+            direction = 1
+
+        elif current_price < bb_lower * 1.002:  # 放宽条件
+
+            breakout_score += 0.4
+
+            direction = -1
+
+        elif current_price < bb_lower:  # 完全突破
+
+            breakout_score += 0.6
+
+            direction = -1
+
+        # 2. 1.0标准差布林带突破（早期信号）
+
+        if direction == 0:  # 如果2.0标准差未突破，检查1.0标准差
+
+            if current_price > bb_upper_1 * 0.999:
+
+                breakout_score += 0.3
+
+                direction = 1
+
+            elif current_price < bb_lower_1 * 1.001:
+
+                breakout_score += 0.3
+
+                direction = -1
+
+        # 归一化突破分数
+
+        if breakout_score > 0:
+            signal_score += (breakout_score / 1.0) * weights['BREAKOUT_SIGNALS']
+
+        # ========== 价格行为确认（改进） ==========
+
+        if direction != 0 and len(prices) >= 5:
+
+            price_action_score = 0.0
+
+            # 短期动量
 
             recent_momentum = (prices[-1] - prices[-5]) / prices[-5] if prices[-5] > 0 else 0
 
-            if direction == 1 and recent_momentum > 0.0005:
+            # 中期动量（更可靠）
 
-                signal_score += weights['PRICE_ACTION']
+            if len(prices) >= 10:
 
-            elif direction == -1 and recent_momentum < -0.0005:
+                medium_momentum = (prices[-1] - prices[-10]) / prices[-10] if prices[-10] > 0 else 0
 
-                signal_score += weights['PRICE_ACTION']
+            else:
+
+                medium_momentum = recent_momentum
+
+            if direction == 1:
+
+                # 价格上涨动量确认
+
+                if recent_momentum > 0.0003:  # 降低阈值
+
+                    price_action_score += 0.4
+
+                if recent_momentum > 0.0005:  # 完全满足
+
+                    price_action_score += 0.3
+
+                if medium_momentum > 0.0005:  # 中期动量确认
+
+                    price_action_score += 0.3
+
+            else:  # direction == -1
+
+                # 价格下跌动量确认
+
+                if recent_momentum < -0.0003:  # 降低阈值
+
+                    price_action_score += 0.4
+
+                if recent_momentum < -0.0005:  # 完全满足
+
+                    price_action_score += 0.3
+
+                if medium_momentum < -0.0005:  # 中期动量确认
+
+                    price_action_score += 0.3
+
+            if price_action_score > 0:
+                signal_score += (price_action_score / 1.0) * weights['PRICE_ACTION']
+
+        # ========== 波动率确认（新增） ==========
+
+        if atr_percent > 0.0006:  # 高波动率确认
+
+            volatility_score = min(1.0, atr_percent / 0.002)  # 归一化
+
+            signal_score += volatility_score * weights['VOLATILITY_INDICATORS']
+
+        # ========== 趋势强度确认（新增） ==========
+
+        if direction != 0 and adx > 25:  # 高波动市也需要趋势强度
+
+            trend_score = min(1.0, adx / 50.0)
+
+            signal_score += trend_score * weights.get('TREND_INDICATORS', 0.15) * 0.5
+
+        # ========== MACD确认（新增） ==========
+
+        if direction != 0:
+
+            if (direction == 1 and macd_hist > 0) or (direction == -1 and macd_hist < 0):
+                signal_score += weights.get('MOMENTUM_INDICATORS', 0.05) * 0.5
+
+        # ========== 成交量确认（如果有） ==========
+
+        if direction != 0:
+
+            volume_profile = self.data_engine.volume_buffer
+
+            if len(volume_profile) >= 5:
+
+                recent_volumes = list(volume_profile)[-5:]
+
+                avg_volume = sum(recent_volumes) / len(recent_volumes) if recent_volumes else 0
+
+                if avg_volume > 0:
+
+                    current_volume = recent_volumes[-1] if recent_volumes else 0
+
+                    volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1.0
+
+                    # 突破时成交量放大是好的信号
+
+                    if volume_ratio > 1.2:
+                        signal_score += 0.05
+
+        # ========== 技术形态识别（新增） ==========
+        if direction != 0:
+            prices = list(self.data_engine.price_buffer)
+            highs = list(self.data_engine.high_buffer)
+            lows = list(self.data_engine.low_buffer)
+
+            if len(prices) >= 20 and len(highs) >= 20 and len(lows) >= 20:
+                patterns = self.pattern_recognizer.detect_patterns(prices, highs, lows)
+
+                for pattern_name, pattern_data in patterns.items():
+                    pattern_type = pattern_data.get('type', 'NEUTRAL')
+                    pattern_strength = pattern_data.get('strength', 0.5)
+
+                    # 高波动市特别关注突破形态
+                    if pattern_name in ['RESISTANCE_BREAKOUT', 'SUPPORT_BREAKDOWN', 'ASCENDING_TRIANGLE',
+                                        'DESCENDING_TRIANGLE', 'FLAG_PATTERN']:
+                        if (direction == 1 and pattern_type == 'BULLISH') or (
+                                direction == -1 and pattern_type == 'BEARISH'):
+                            pattern_score = pattern_strength * weights.get('BREAKOUT_SIGNALS', 0.20) * 0.5
+                            signal_score += pattern_score
+                    # 楔形形态也给予分数
+                    elif pattern_name in ['RISING_WEDGE', 'FALLING_WEDGE']:
+                        if (direction == 1 and pattern_type == 'BULLISH') or (
+                                direction == -1 and pattern_type == 'BEARISH'):
+                            pattern_score = pattern_strength * weights.get('BREAKOUT_SIGNALS', 0.20) * 0.3
+                            signal_score += pattern_score
+
+        # ========== 生成信号 ==========
 
         if signal_score > 0 and direction != 0:
             return {
@@ -2408,6 +3610,22 @@ class ProfessionalPositionManager:
 
         self.position_tp_targets = {}
 
+        # 记录最近开仓的时间和价格（用于防止在相近价格连开多单）
+        self.last_trade_time = 0
+        self.last_trade_price = 0.0
+        self.last_trade_direction = None  # 'BUY' 或 'SELL'
+
+        # 记录已经设置过止盈止损的订单ticket，避免重复设置
+        self.sl_tp_set_positions = set()
+
+    @staticmethod
+    def normalize_price(price: float, digits: int) -> float:
+        """规范化价格到指定精度"""
+        if digits <= 0:
+            return round(price, 2)
+        multiplier = 10 ** digits
+        return round(price * multiplier) / multiplier
+
     def get_open_positions(self) -> Dict:
 
         """获取当前持仓"""
@@ -2453,7 +3671,7 @@ class ProfessionalPositionManager:
                     if ticket in self.position_tp_targets:
                         new_positions[ticket]['tp_targets'] = self.position_tp_targets[ticket]
 
-            # 清理已平仓的持仓的多目标止盈信息
+            # 清理已平仓的持仓的多目标止盈信息和止盈止损设置记录
 
             closed_tickets = set(self.open_positions.keys()) - set(new_positions.keys())
 
@@ -2461,6 +3679,9 @@ class ProfessionalPositionManager:
 
                 if ticket in self.position_tp_targets:
                     del self.position_tp_targets[ticket]
+
+                if ticket in self.sl_tp_set_positions:
+                    self.sl_tp_set_positions.discard(ticket)
 
             self.open_positions = new_positions
 
@@ -2622,9 +3843,13 @@ class ProfessionalPositionManager:
 
             return mt5.ORDER_FILLING_RETURN
 
-    def can_open_new_position(self) -> bool:
+    def can_open_new_position(self, signal: Optional[Dict] = None) -> bool:
 
         """检查是否可以开新仓"""
+
+        if not signal:
+            logger.debug("⏸️ 无信号，无法开仓")
+            return False
 
         # 检查每日交易限制
 
@@ -2636,7 +3861,7 @@ class ProfessionalPositionManager:
             self.last_trade_date = current_date
 
         if self.daily_trades >= ProfessionalComplexConfig.MAX_DAILY_TRADES:
-            logger.warning(f"⚠️ 达到每日交易限制: {self.daily_trades}")
+            logger.warning(f"⚠️ 达到每日交易限制: {self.daily_trades}/{ProfessionalComplexConfig.MAX_DAILY_TRADES}")
 
             return False
 
@@ -2645,22 +3870,186 @@ class ProfessionalPositionManager:
         self.get_open_positions()
 
         if len(self.open_positions) >= ProfessionalComplexConfig.MAX_CONCURRENT_TRADES:
-            logger.warning(f"⚠️ 达到最大并发持仓: {len(self.open_positions)}")
+            logger.warning(
+                f"⚠️ 达到最大并发持仓: {len(self.open_positions)}/{ProfessionalComplexConfig.MAX_CONCURRENT_TRADES}")
 
             return False
 
         # 检查风险限制
 
         if not self.risk_manager.check_risk_limits():
+            logger.info(f"⏸️ 风险限制检查未通过，无法开仓")
+
             return False
 
+        # 检查是否已有相反方向的持仓（不允许同时存在多和空）
+        if signal:
+            new_direction = signal.get('direction')
+            # 获取当前持仓
+            current_positions = self.get_open_positions()
+
+            # 检查是否有相反方向的持仓
+            opposite_positions = []
+            for ticket, pos in current_positions.items():
+                existing_direction = pos.get('type')  # 'BUY' 或 'SELL'
+                if existing_direction != new_direction:
+                    opposite_positions.append((ticket, pos))
+
+            if opposite_positions:
+                # 有相反方向的持仓，需要判断是否为反转信号
+                signal_strength = signal.get('strength', 0)
+                reversal_signal_threshold = 0.7  # 反转信号强度阈值
+
+                # 记录所有相反方向持仓的信息
+                opposite_info = []
+                for ticket, pos in opposite_positions:
+                    existing_direction = pos.get('type')
+                    opposite_info.append(f"{existing_direction}(ticket:{ticket})")
+                logger.info(
+                    f"🔍 检测到相反方向持仓: {', '.join(opposite_info)}，新信号: {new_direction} 强度: {signal_strength:.2f}")
+
+                if signal_strength >= reversal_signal_threshold:
+                    # 是反转信号，检查现有持仓是否盈利
+                    for ticket, pos in opposite_positions:
+                        entry_price = pos.get('price_open', 0)
+                        current_price = pos.get('price_current', 0)
+                        existing_direction = pos.get('type')
+
+                        if entry_price > 0 and current_price > 0:
+                            if existing_direction == 'BUY':
+                                # BUY订单：当前价格 > 入场价 = 盈利
+                                is_profitable = current_price > entry_price
+                            else:  # SELL
+                                # SELL订单：当前价格 < 入场价 = 盈利
+                                is_profitable = current_price < entry_price
+
+                            if is_profitable:
+                                # 反转信号且现有持仓盈利，允许开仓（但需要先平仓）
+                                logger.info(
+                                    f"🔄 检测到反转信号（强度: {signal_strength:.2f}），现有{existing_direction}持仓盈利，将先平仓后开新{new_direction}单")
+                                # 返回True，让open_position方法处理平仓逻辑
+                                return True
+                            else:
+                                # 反转信号但现有持仓亏损，不允许开仓
+                                logger.warning(
+                                    f"⚠️ 检测到反转信号（强度: {signal_strength:.2f}），但现有{existing_direction}持仓亏损(入场:{entry_price:.2f}, 当前:{current_price:.2f})，不允许开新{new_direction}单")
+                                return False
+                else:
+                    # 不是反转信号，不允许开仓
+                    existing_direction = opposite_positions[0][1].get('type')  # 获取第一个相反方向持仓的方向
+                    logger.warning(
+                        f"⚠️ 检测到相反方向持仓（{existing_direction}），新信号方向为{new_direction}但强度不足（{signal_strength:.2f} < {reversal_signal_threshold}），不允许开仓")
+                    return False
+
+        # 检查是否顺应K线趋势（顺势单：每一单都应该顺应K线趋势）
+        if signal:
+            new_direction = signal.get('direction')
+            # 获取技术指标来判断当前K线趋势
+            indicators = self.data_engine.calculate_complex_indicators()
+            if indicators:
+                # 判断K线趋势方向
+                ema_alignment = indicators.get('EMA_ALIGNMENT', 0)  # >0表示上升趋势，<0表示下降趋势
+                macd_trend = indicators.get('MACD_TREND', 0)  # >0表示看涨，<0表示看跌
+                adx = indicators.get('ADX', 0)  # 趋势强度
+                plus_di = indicators.get('PLUS_DI', 0)
+                minus_di = indicators.get('MINUS_DI', 0)
+
+                # 综合判断趋势方向
+                trend_direction = 0  # 0=无明确趋势, 1=上升趋势, -1=下降趋势
+
+                # 如果ADX > 20，说明有明确趋势
+                if adx > 20:
+                    # 综合多个指标判断趋势
+                    bullish_signals = 0
+                    bearish_signals = 0
+
+                    if ema_alignment > 0.3:
+                        bullish_signals += 1
+                    elif ema_alignment < -0.3:
+                        bearish_signals += 1
+
+                    if macd_trend > 0.2:
+                        bullish_signals += 1
+                    elif macd_trend < -0.2:
+                        bearish_signals += 1
+
+                    if plus_di > minus_di and plus_di > 20:
+                        bullish_signals += 1
+                    elif minus_di > plus_di and minus_di > 20:
+                        bearish_signals += 1
+
+                    if bullish_signals >= 2:
+                        trend_direction = 1  # 上升趋势
+                    elif bearish_signals >= 2:
+                        trend_direction = -1  # 下降趋势
+
+                # 检查订单方向是否顺应K线趋势
+                if trend_direction != 0:
+                    if new_direction == 'BUY' and trend_direction < 0:
+                        logger.warning(
+                            f"⚠️ 订单方向与K线趋势不符: 当前为下降趋势(EMA={ema_alignment:.2f}, MACD={macd_trend:.2f}, ADX={adx:.1f})，不允许开BUY单")
+                        return False
+                    elif new_direction == 'SELL' and trend_direction > 0:
+                        logger.warning(
+                            f"⚠️ 订单方向与K线趋势不符: 当前为上升趋势(EMA={ema_alignment:.2f}, MACD={macd_trend:.2f}, ADX={adx:.1f})，不允许开SELL单")
+                        return False
+                else:
+                    # 如果趋势不明确（ADX < 20），允许开仓（可能是震荡市）
+                    logger.debug(f"📊 趋势不明确(ADX={adx:.1f})，允许开仓")
+
+        # 检查短时间内价格差是否超过10美元（防止在相近价格连开多单）
+        # 注意：使用美元价格差而不是点数，因为点数会随手数不同而变化
+        # 注意：只有在当前有持仓的情况下才检查价差限制，如果没有持仓则允许开新仓
+        if signal and len(self.open_positions) > 0 and self.last_trade_time > 0:
+            current_time = time.time()
+            time_diff = current_time - self.last_trade_time
+            min_time_interval = 180  # 3分钟 = 180秒
+            min_price_diff_usd = 10.0  # 最小价差10美元
+
+            if time_diff < min_time_interval:
+                # 在3分钟内，检查价差
+                current_price = signal.get('entry_price', 0)
+                if current_price > 0 and self.last_trade_price > 0:
+                    # 直接计算美元价格差
+                    price_diff_usd = abs(current_price - self.last_trade_price)
+
+                    if price_diff_usd < min_price_diff_usd:
+                        logger.info(f"⏸️ 短时间内价差不足: 距离上次开仓 {time_diff:.1f}秒, "
+                                    f"价差 ${price_diff_usd:.2f} < ${min_price_diff_usd:.2f} (要求至少10美元价差), "
+                                    f"上次价格: {self.last_trade_price:.2f}, 当前价格: {current_price:.2f}, "
+                                    f"上次方向: {self.last_trade_direction}")
+                        return False
+                    else:
+                        logger.debug(f"✅ 价差检查通过: ${price_diff_usd:.2f} >= ${min_price_diff_usd:.2f}")
+            else:
+                # 超过3分钟，仍然检查价差（但时间限制更长，比如30分钟内）
+                extended_time_interval = 1800  # 30分钟 = 1800秒
+                if time_diff < extended_time_interval:
+                    current_price = signal.get('entry_price', 0)
+                    if current_price > 0 and self.last_trade_price > 0:
+                        # 直接计算美元价格差
+                        price_diff_usd = abs(current_price - self.last_trade_price)
+
+                        if price_diff_usd < min_price_diff_usd:
+                            logger.warning(f"⚠️ 30分钟内价差不足: 距离上次开仓 {time_diff / 60:.1f}分钟, "
+                                           f"价差 ${price_diff_usd:.2f} < ${min_price_diff_usd:.2f} (要求至少10美元价差), "
+                                           f"上次价格: {self.last_trade_price:.2f}, 当前价格: {current_price:.2f}")
+                            return False
+                        else:
+                            logger.debug(f"✅ 价差检查通过: ${price_diff_usd:.2f} >= ${min_price_diff_usd:.2f}")
+
+        # 所有检查都通过
+        logger.debug(f"✅ 所有开仓检查通过: {signal.get('direction')} 强度: {signal.get('strength', 0):.2f}")
         return True
 
     def open_position(self, signal: Dict) -> Optional[int]:
 
         """开仓 - 使用先下单后设置止盈止损的方式"""
 
-        if not self.can_open_new_position():
+        if not self.can_open_new_position(signal):
+            # 记录为什么不能开仓（用于调试）
+            logger.info(
+                f"⏸️ 信号已生成但无法开仓: {signal.get('direction')} 强度: {signal.get('strength', 0):.2f} 价格: {signal.get('entry_price', 0):.2f} - 检查can_open_new_position返回False")
             return None
 
         try:
@@ -2673,6 +4062,57 @@ class ProfessionalPositionManager:
                 logger.error("无法获取品种信息")
 
                 return None
+
+            # 处理相反方向的持仓（反转信号时先平仓盈利订单）
+            new_direction = signal.get('direction')
+            current_positions = self.get_open_positions()
+
+            # 检查是否有相反方向的持仓
+            opposite_positions = []
+            for ticket, pos in current_positions.items():
+                existing_direction = pos.get('type')  # 'BUY' 或 'SELL'
+                if existing_direction != new_direction:
+                    opposite_positions.append((ticket, pos))
+
+            # 如果有相反方向的持仓，且是反转信号，先平仓
+            if opposite_positions:
+                signal_strength = signal.get('strength', 0)
+                reversal_signal_threshold = 0.7  # 反转信号强度阈值
+
+                if signal_strength >= reversal_signal_threshold:
+                    all_closed = True
+                    for ticket, pos in opposite_positions:
+                        entry_price = pos.get('price_open', 0)
+                        current_price = pos.get('price_current', 0)
+                        existing_direction = pos.get('type')
+
+                        if entry_price > 0 and current_price > 0:
+                            if existing_direction == 'BUY':
+                                is_profitable = current_price > entry_price
+                            else:  # SELL
+                                is_profitable = current_price < entry_price
+
+                            if is_profitable:
+                                # 平仓盈利的相反方向订单
+                                logger.info(f"🔄 反转信号：先平仓盈利的{existing_direction}订单 (ticket: {ticket})")
+                                close_success = self._close_position(ticket, existing_direction)
+                                if close_success:
+                                    logger.info(f"✅ 已平仓{existing_direction}订单，准备开新{new_direction}单")
+                                else:
+                                    logger.warning(f"⚠️ 平仓{existing_direction}订单失败，取消开新单")
+                                    all_closed = False
+
+                    # 如果平仓失败，不允许开新单
+                    if not all_closed:
+                        logger.warning(f"⚠️ 部分相反方向订单平仓失败，取消开新单")
+                        return None
+
+                    # 等待持仓完全关闭
+                    time.sleep(0.5)
+                else:
+                    # 不是反转信号，不应该到达这里（应该在can_open_new_position中被阻止）
+                    logger.warning(f"⚠️ 检测到相反方向持仓但信号强度不足，不允许开仓")
+                    return None
 
             # 获取当前价格
 
@@ -2719,18 +4159,17 @@ class ProfessionalPositionManager:
 
                 tp_price = tp_levels[0]['price'] if tp_levels else entry_price - stop_loss_distance * point * 2
 
-            # 规范化价格
-
-            sl_price = round(sl_price / point) * point
-
-            tp_price = round(tp_price / point) * point
+            # 规范化价格（使用digits精度）
+            digits = symbol_info.digits
+            sl_price = self.normalize_price(sl_price, digits)
+            tp_price = self.normalize_price(tp_price, digits)
 
             # 验证止损止盈价格是否符合品种要求
             # 获取最小止损距离（点数）
-            # MT5可能使用trade_stops_level属性，如果没有则使用2个点差
+            # MT5可能使用trade_stops_level属性，如果没有则使用合理的默认值
             stops_level = 0
             try:
-                # 尝试使用trade_stops_level属性
+                # 尝试使用trade_stops_level属性（这是MT5的标准属性）
                 if hasattr(symbol_info, 'trade_stops_level'):
                     stops_level = symbol_info.trade_stops_level
                 elif hasattr(symbol_info, 'stops_level'):
@@ -2738,11 +4177,23 @@ class ProfessionalPositionManager:
             except:
                 pass
 
-            # 如果仍然为0，则使用当前点差的2倍（MT5黄金要求至少2个点差）
+            # 如果仍然为0，则使用合理的默认值
+            # 对于黄金，通常最小止损距离是10-50点，而不是200点，但是挂单或者修改订单止盈止损的话，点差没有超过200点是无法成功的
             if stops_level <= 0:
                 current_spread = (symbol_info.ask - symbol_info.bid) / point  # 当前点差（点数）
-                stops_level = max(2, int(current_spread * 2))  # 至少2个点差，或当前点差的2倍
-                logger.debug(f"使用计算的最小止损距离: {stops_level}点（当前点差: {current_spread:.1f}点）")
+                # 使用点差的5倍或至少10点，但不超过50点
+                stops_level = max(10, min(50, int(current_spread * 5)))
+                logger.info(
+                    f"⚠️ 品种未提供trade_stops_level，使用计算值: {stops_level}点（当前点差: {current_spread:.1f}点）")
+            else:
+                logger.info(f"📏 品种最小止损距离: {stops_level}点")
+
+            # 增加安全边际：增加20%的距离，并考虑滑点（最多20点）
+            safety_margin = 1.2  # 20%安全边际
+            slippage_buffer = 20  # 滑点缓冲（点数）
+            effective_stops_level = int(stops_level * safety_margin) + slippage_buffer
+            logger.info(
+                f"🛡️ 应用安全边际: 基础距离={stops_level}点, 安全距离={effective_stops_level}点 (安全边际={safety_margin:.0%}, 滑点缓冲={slippage_buffer}点)")
 
             if stops_level > 0:
 
@@ -2760,39 +4211,42 @@ class ProfessionalPositionManager:
 
                     tp_distance_points = (entry_price - tp_price) / point
 
-                # 确保止损和止盈距离符合最小要求
-
-                if sl_distance_points < stops_level:
+                # 使用安全距离（effective_stops_level）而不是基础距离
+                if sl_distance_points < effective_stops_level:
 
                     # 调整止损价格以满足最小距离要求
 
                     if signal['direction'] == 'BUY':
 
-                        sl_price = entry_price - stops_level * point
+                        sl_price = entry_price - effective_stops_level * point
 
                     else:
 
-                        sl_price = entry_price + stops_level * point
+                        sl_price = entry_price + effective_stops_level * point
 
-                    sl_price = round(sl_price / point) * point
+                    # 规范化价格
+                    digits = symbol_info.digits
+                    sl_price = self.normalize_price(sl_price, digits)
 
-                    logger.debug(f"调整止损价格以满足最小距离要求: {stops_level}点")
+                    logger.debug(f"调整止损价格以满足最小距离要求: {effective_stops_level}点（基础: {stops_level}点）")
 
-                if tp_distance_points < stops_level:
+                if tp_distance_points < effective_stops_level:
 
                     # 调整止盈价格以满足最小距离要求
 
                     if signal['direction'] == 'BUY':
 
-                        tp_price = entry_price + stops_level * point
+                        tp_price = entry_price + effective_stops_level * point
 
                     else:
 
-                        tp_price = entry_price - stops_level * point
+                        tp_price = entry_price - effective_stops_level * point
 
-                    tp_price = round(tp_price / point) * point
+                    # 规范化价格
+                    digits = symbol_info.digits
+                    tp_price = self.normalize_price(tp_price, digits)
 
-                    logger.debug(f"调整止盈价格以满足最小距离要求: {stops_level}点")
+                    logger.debug(f"调整止盈价格以满足最小距离要求: {effective_stops_level}点（基础: {stops_level}点）")
 
             # 验证止损止盈价格方向是否正确
 
@@ -2875,6 +4329,11 @@ class ProfessionalPositionManager:
 
             logger.info(f"✅ 开仓成功: {signal['direction']} {lot_size}手 @ {entry_price:.2f} (订单号: {order_ticket})")
 
+            # 更新最近开仓的时间和价格
+            self.last_trade_time = time.time()
+            self.last_trade_price = entry_price
+            self.last_trade_direction = signal['direction']
+
             # 保存多目标止盈信息
 
             if tp_levels and len(tp_levels) > 0:
@@ -2898,7 +4357,9 @@ class ProfessionalPositionManager:
 
                 for tp_level in tp_levels:
 
-                    normalized_price = round(tp_level['price'] / point) * point
+                    # 规范化价格（使用digits精度）
+                    digits = symbol_info.digits
+                    normalized_price = self.normalize_price(tp_level['price'], digits)
 
                     # 验证止盈目标是否满足最小距离要求
                     if signal['direction'] == 'BUY':
@@ -2912,7 +4373,7 @@ class ProfessionalPositionManager:
                             normalized_price = entry_price + min_stops_level * point
                         else:
                             normalized_price = entry_price - min_stops_level * point
-                        normalized_price = round(normalized_price / point) * point
+                        normalized_price = self.normalize_price(normalized_price, digits)
                         logger.debug(f"调整止盈目标价格以满足最小距离要求: {min_stops_level}点")
 
                     normalized_tp_levels.append({
@@ -2947,118 +4408,199 @@ class ProfessionalPositionManager:
 
                 return order_ticket
 
-            # 第二步：立即设置止盈止损
-
-            # 等待一小段时间确保订单已完全建立并转换为持仓
-
-            time.sleep(0.2)
-
-            # 获取持仓ticket（订单ticket和持仓ticket可能不同）
-
+            # 第二步：立即设置止盈止损（尽可能快）
+            # 订单成交后立即尝试设置，不等待，通过多次尝试来确保持仓建立
             position_ticket = None
+            actual_position = None
+            max_find_attempts = 10  # 增加尝试次数，但每次等待时间更短
+            find_attempt_interval = 0.05  # 每次只等待0.05秒，更快响应
 
-            positions = mt5.positions_get(symbol=symbol)
+            for attempt in range(max_find_attempts):
+                positions = mt5.positions_get(symbol=symbol)
+                if positions:
+                    for pos in positions:
+                        # 通过订单号或价格匹配找到对应的持仓
+                        # 优先使用identifier匹配，如果没有则使用价格和类型匹配
+                        if hasattr(pos, 'identifier') and pos.identifier == order_ticket:
+                            position_ticket = pos.ticket
+                            actual_position = pos
+                            logger.info(
+                                f"✅ 通过identifier找到持仓: ticket={position_ticket}, order_ticket={order_ticket} (尝试 {attempt + 1})")
+                            break
+                        elif pos.type == order_type and abs(pos.price_open - entry_price) < point * 10:
+                            # 检查是否已经匹配过（避免重复匹配）
+                            if position_ticket is None or position_ticket != pos.ticket:
+                                position_ticket = pos.ticket
+                                actual_position = pos
+                                logger.info(
+                                    f"✅ 通过价格匹配找到持仓: ticket={position_ticket}, 入场价={pos.price_open:.{symbol_info.digits}f} (尝试 {attempt + 1})")
+                            break
 
-            if positions:
-
-                for pos in positions:
-                    # 通过订单号或价格匹配找到对应的持仓
-                    if (hasattr(pos, 'identifier') and pos.identifier == order_ticket) or \
-                            (pos.type == order_type and abs(pos.price_open - entry_price) < point * 10):
-                        position_ticket = pos.ticket
+                    if position_ticket:
                         break
 
+                if attempt < max_find_attempts - 1:
+                    time.sleep(find_attempt_interval)  # 只等待0.05秒
+
             if not position_ticket:
+
                 # 如果找不到持仓，尝试使用订单号（某些情况下可能相同）
 
                 logger.warning(f"⚠️ 未找到对应持仓，尝试使用订单号: {order_ticket}")
-
                 position_ticket = order_ticket
+
+                # 再次尝试获取持仓信息
+                positions = mt5.positions_get(symbol=symbol)
+                if positions:
+                    for pos in positions:
+                        if pos.ticket == position_ticket:
+                            actual_position = pos
+                            break
 
             # 使用 OrderModify 设置止盈止损
             # 获取实际持仓信息，使用实际入场价格重新验证止盈止损
-            positions = mt5.positions_get(symbol=symbol)
+            if not actual_position:
+                positions = mt5.positions_get(symbol=symbol)
+                if positions:
+                    for pos in positions:
+                        if pos.ticket == position_ticket:
+                            actual_position = pos
+                            break
+
             actual_entry_price = entry_price
-            if positions:
-                for pos in positions:
-                    if pos.ticket == position_ticket:
-                        actual_entry_price = pos.price_open
-                        # 使用实际入场价格重新验证和调整止盈止损
-                        point = symbol_info.point
-                        stops_level = 0
-                        try:
-                            if hasattr(symbol_info, 'trade_stops_level'):
-                                stops_level = symbol_info.trade_stops_level
-                            elif hasattr(symbol_info, 'stops_level'):
-                                stops_level = symbol_info.stops_level
-                        except:
-                            pass
+            current_sl = 0
+            current_tp = 0
 
-                        if stops_level <= 0:
-                            current_spread = (symbol_info.ask - symbol_info.bid) / point
-                            stops_level = max(2, int(current_spread * 2))
+            if actual_position:
+                actual_entry_price = actual_position.price_open
+                current_sl = actual_position.sl if hasattr(actual_position, 'sl') else 0
+                current_tp = actual_position.tp if hasattr(actual_position, 'tp') else 0
+                logger.info(
+                    f"📋 当前持仓信息: ticket={position_ticket}, 入场价={actual_entry_price:.{symbol_info.digits}f}, "
+                    f"当前SL={current_sl:.{symbol_info.digits}f}, 当前TP={current_tp:.{symbol_info.digits}f}")
 
-                        logger.debug(
-                            f"验证止盈止损: 入场价={actual_entry_price:.2f}, 方向={signal['direction']}, 最小距离={stops_level}点")
+            # 使用实际入场价格重新验证和调整止盈止损
+            point = symbol_info.point
+            digits = symbol_info.digits
+            stops_level = 0
+            try:
+                if hasattr(symbol_info, 'trade_stops_level'):
+                    stops_level = symbol_info.trade_stops_level
+                elif hasattr(symbol_info, 'stops_level'):
+                    stops_level = symbol_info.stops_level
+            except:
+                pass
 
-                        # 重新验证止损
-                        if sl_price > 0:
-                            if signal['direction'] == 'BUY':
-                                sl_distance = (actual_entry_price - sl_price) / point
-                                if sl_price >= actual_entry_price or sl_distance < stops_level:
-                                    old_sl = sl_price
-                                    sl_price = actual_entry_price - stops_level * point
-                                    sl_price = round(sl_price / point) * point
-                                    logger.debug(f"调整止损: {old_sl:.2f} -> {sl_price:.2f} (距离: {stops_level}点)")
-                            else:  # SELL
-                                sl_distance = (sl_price - actual_entry_price) / point
-                                if sl_price <= actual_entry_price or sl_distance < stops_level:
-                                    old_sl = sl_price
-                                    sl_price = actual_entry_price + stops_level * point
-                                    sl_price = round(sl_price / point) * point
-                                    logger.debug(f"调整止损: {old_sl:.2f} -> {sl_price:.2f} (距离: {stops_level}点)")
+            if stops_level <= 0:
+                current_spread = (symbol_info.ask - symbol_info.bid) / point
+                stops_level = max(10, min(50, int(current_spread * 5)))
 
-                            # 最终验证止损方向
-                            if signal['direction'] == 'BUY' and sl_price >= actual_entry_price:
-                                logger.warning(f"⚠️ 止损价格无效（BUY订单止损应低于入场价），跳过设置止损")
-                                sl_price = 0
-                            elif signal['direction'] == 'SELL' and sl_price <= actual_entry_price:
-                                logger.warning(f"⚠️ 止损价格无效（SELL订单止损应高于入场价），跳过设置止损")
-                                sl_price = 0
+            # 应用安全边际
+            safety_margin = 1.2  # 20%安全边际
+            slippage_buffer = 20  # 滑点缓冲（点数）
+            effective_stops_level = int(stops_level * safety_margin) + slippage_buffer
 
-                        # 重新验证止盈
-                        if tp_price > 0:
-                            if signal['direction'] == 'BUY':
-                                tp_distance = (tp_price - actual_entry_price) / point
-                                if tp_price <= actual_entry_price or tp_distance < stops_level:
-                                    old_tp = tp_price
-                                    tp_price = actual_entry_price + stops_level * point
-                                    tp_price = round(tp_price / point) * point
-                                    logger.debug(f"调整止盈: {old_tp:.2f} -> {tp_price:.2f} (距离: {stops_level}点)")
-                            else:  # SELL
-                                tp_distance = (actual_entry_price - tp_price) / point
-                                if tp_price >= actual_entry_price or tp_distance < stops_level:
-                                    old_tp = tp_price
-                                    tp_price = actual_entry_price - stops_level * point
-                                    tp_price = round(tp_price / point) * point
-                                    logger.debug(f"调整止盈: {old_tp:.2f} -> {tp_price:.2f} (距离: {stops_level}点)")
+            logger.info(
+                f"🔍 验证止盈止损: 入场价={actual_entry_price:.{digits}f}, 方向={signal['direction']}, 基础距离={stops_level}点, 安全距离={effective_stops_level}点, point={point}, digits={digits}")
+            logger.info(f"🔍 初始价格: SL={sl_price:.{digits}f}, TP={tp_price:.{digits}f}")
 
-                            # 最终验证止盈方向
-                            if signal['direction'] == 'BUY' and tp_price <= actual_entry_price:
-                                logger.warning(f"⚠️ 止盈价格无效（BUY订单止盈应高于入场价），跳过设置止盈")
-                                tp_price = 0
-                            elif signal['direction'] == 'SELL' and tp_price >= actual_entry_price:
-                                logger.warning(f"⚠️ 止盈价格无效（SELL订单止盈应低于入场价），跳过设置止盈")
-                                tp_price = 0
+            if actual_position:
+                # 重新验证止损（使用安全距离）
+                if sl_price > 0:
+                    if signal['direction'] == 'BUY':
+                        sl_distance = (actual_entry_price - sl_price) / point
+                        logger.info(f"🔍 BUY止损验证: 距离={sl_distance:.1f}点, 要求>={effective_stops_level}点")
+                        if sl_price >= actual_entry_price or sl_distance < effective_stops_level:
+                            old_sl = sl_price
+                            sl_price = actual_entry_price - effective_stops_level * point
+                            sl_price = self.normalize_price(sl_price, digits)
+                            logger.info(
+                                f"✅ 调整止损: {old_sl:.{digits}f} -> {sl_price:.{digits}f} (距离: {effective_stops_level}点)")
+                    else:  # SELL
+                        sl_distance = (sl_price - actual_entry_price) / point
+                        logger.info(f"🔍 SELL止损验证: 距离={sl_distance:.1f}点, 要求>={effective_stops_level}点")
+                        if sl_price <= actual_entry_price or sl_distance < effective_stops_level:
+                            old_sl = sl_price
+                            sl_price = actual_entry_price + effective_stops_level * point
+                            sl_price = self.normalize_price(sl_price, digits)
+                            logger.info(
+                                f"✅ 调整止损: {old_sl:.{digits}f} -> {sl_price:.{digits}f} (距离: {effective_stops_level}点)")
 
-                        logger.debug(f"最终止盈止损: SL={sl_price:.2f}, TP={tp_price:.2f}")
-                        break
+                    # 最终验证止损方向
+                    if signal['direction'] == 'BUY' and sl_price >= actual_entry_price:
+                        logger.warning(
+                            f"⚠️ 止损价格无效（BUY订单止损应低于入场价 {actual_entry_price:.{digits}f}），跳过设置止损")
+                        sl_price = 0
+                    elif signal['direction'] == 'SELL' and sl_price <= actual_entry_price:
+                        logger.warning(
+                            f"⚠️ 止损价格无效（SELL订单止损应高于入场价 {actual_entry_price:.{digits}f}），跳过设置止损")
+                        sl_price = 0
+
+                # 重新验证止盈（使用安全距离）
+                if tp_price > 0:
+                    if signal['direction'] == 'BUY':
+                        tp_distance = (tp_price - actual_entry_price) / point
+                        logger.info(f"🔍 BUY止盈验证: 距离={tp_distance:.1f}点, 要求>={effective_stops_level}点")
+                        if tp_price <= actual_entry_price or tp_distance < effective_stops_level:
+                            old_tp = tp_price
+                            tp_price = actual_entry_price + effective_stops_level * point
+                            tp_price = self.normalize_price(tp_price, digits)
+                            logger.info(
+                                f"✅ 调整止盈: {old_tp:.{digits}f} -> {tp_price:.{digits}f} (距离: {effective_stops_level}点)")
+                    else:  # SELL
+                        tp_distance = (actual_entry_price - tp_price) / point
+                        logger.info(f"🔍 SELL止盈验证: 距离={tp_distance:.1f}点, 要求>={effective_stops_level}点")
+                        if tp_price >= actual_entry_price or tp_distance < effective_stops_level:
+                            old_tp = tp_price
+                            tp_price = actual_entry_price - effective_stops_level * point
+                            tp_price = self.normalize_price(tp_price, digits)
+                            logger.info(
+                                f"✅ 调整止盈: {old_tp:.{digits}f} -> {tp_price:.{digits}f} (距离: {effective_stops_level}点)")
+
+                    # 最终验证止盈方向
+                    if signal['direction'] == 'BUY' and tp_price <= actual_entry_price:
+                        logger.warning(
+                            f"⚠️ 止盈价格无效（BUY订单止盈应高于入场价 {actual_entry_price:.{digits}f}），跳过设置止盈")
+                        tp_price = 0
+                    elif signal['direction'] == 'SELL' and tp_price >= actual_entry_price:
+                        logger.warning(
+                            f"⚠️ 止盈价格无效（SELL订单止盈应低于入场价 {actual_entry_price:.{digits}f}），跳过设置止盈")
+                        tp_price = 0
+
+                # 最终规范化价格
+                if sl_price > 0:
+                    sl_price = self.normalize_price(sl_price, digits)
+                if tp_price > 0:
+                    tp_price = self.normalize_price(tp_price, digits)
+
+                logger.info(f"✅ 最终止盈止损: SL={sl_price:.{digits}f}, TP={tp_price:.{digits}f}")
+            else:
+                logger.warning(f"⚠️ 无法获取持仓信息，使用原始价格")
 
             # 只设置有效的止损和止盈
             if sl_price == 0 and tp_price == 0:
                 logger.warning(f"⚠️ 止损和止盈都无效，跳过设置")
                 self.daily_trades += 1
                 return order_ticket
+
+            # 检查是否找到持仓ticket
+            if not position_ticket:
+                logger.warning(f"⚠️ 未找到持仓ticket，无法设置止盈止损")
+                self.daily_trades += 1
+                return order_ticket
+
+            # 检查是否已经为该持仓设置过止盈止损，避免重复设置
+            if position_ticket in self.sl_tp_set_positions:
+                logger.info(f"ℹ️ 持仓 {position_ticket} 已经设置过止盈止损，跳过重复设置")
+                self.daily_trades += 1
+                return order_ticket
+
+            # 确保价格规范化
+            digits = symbol_info.digits
+            if sl_price > 0:
+                sl_price = self.normalize_price(sl_price, digits)
+            if tp_price > 0:
+                tp_price = self.normalize_price(tp_price, digits)
 
             modify_request = {
 
@@ -3076,88 +4618,169 @@ class ProfessionalPositionManager:
             if tp_price > 0:
                 modify_request["tp"] = tp_price
 
-            logger.debug(f"发送止盈止损设置请求: {modify_request}")
+            logger.info(
+                f"📤 发送止盈止损设置请求: position={position_ticket}, SL={modify_request.get('sl', 0):.{digits}f}, TP={modify_request.get('tp', 0):.{digits}f}")
             modify_result = mt5.order_send(modify_request)
 
-            if modify_result is None:
+            # 如果设置失败，使用最新价格重新计算并重试
+            max_retries = 3  # 增加重试次数
+            retry_count = 0
+            setup_success = False
 
-                error_code = mt5.last_error()
+            while retry_count < max_retries:
+                if modify_result is None:
+                    error_code = mt5.last_error()
+                    logger.warning(
+                        f"⚠️ 止盈止损设置失败 (尝试 {retry_count + 1}/{max_retries}): order_send返回None，错误代码: {error_code[0]} - {error_code[1]}")
+                elif modify_result.retcode != mt5.TRADE_RETCODE_DONE:
+                    error_code = modify_result.retcode
+                    error_comment = modify_result.comment
+                    logger.warning(
+                        f"⚠️ 止盈止损设置失败 (尝试 {retry_count + 1}/{max_retries}): {error_code} - {error_comment}")
 
-                logger.warning(f"⚠️ 止盈止损设置失败: order_send返回None，错误代码: {error_code[0]} - {error_code[1]}")
+                    # 特殊处理错误代码 10025 "No changes"
+                    if error_code == 10025:
+                        logger.info(f"🔄 检测到错误10025 (No changes)，检查当前持仓的止盈止损...")
+                        # 重新获取持仓信息
+                        positions = mt5.positions_get(symbol=symbol)
+                        if positions:
+                            for pos in positions:
+                                if pos.ticket == position_ticket:
+                                    current_sl = pos.sl if hasattr(pos, 'sl') else 0
+                                    current_tp = pos.tp if hasattr(pos, 'tp') else 0
+                                    logger.info(
+                                        f"📋 当前持仓止盈止损: SL={current_sl:.{digits}f}, TP={current_tp:.{digits}f}")
 
-                # 如果失败，再等待一下并重试
+                                    # 如果当前止盈止损和我们要设置的值相同，说明已经设置成功了
+                                    if abs(current_sl - sl_price) < point * 0.1 and abs(
+                                            current_tp - tp_price) < point * 0.1:
+                                        logger.info(
+                                            f"✅ 止盈止损已存在且值相同，视为设置成功: SL:{sl_price:.{digits}f} TP:{tp_price:.{digits}f}")
+                                        setup_success = True
+                                        # 记录已设置止盈止损的持仓，避免重复设置
+                                        self.sl_tp_set_positions.add(position_ticket)
+                                        break
+                                    else:
+                                        # 如果值不同，调整价格后重试
+                                        logger.info(f"🔄 当前止盈止损值与请求不同，调整后重试...")
+                                        # 如果当前有止盈止损，我们需要设置不同的值
+                                        if current_sl > 0 and abs(current_sl - sl_price) < point * 0.1:
+                                            # 当前止损和我们要设置的值太接近，调整
+                                            if signal['direction'] == 'BUY':
+                                                sl_price = actual_entry_price - (effective_stops_level + 10) * point
+                                            else:
+                                                sl_price = actual_entry_price + (effective_stops_level + 10) * point
+                                            sl_price = self.normalize_price(sl_price, digits)
 
-                time.sleep(0.2)
+                                        if current_tp > 0 and abs(current_tp - tp_price) < point * 0.1:
+                                            # 当前止盈和我们要设置的值太接近，调整
+                                            if signal['direction'] == 'BUY':
+                                                tp_price = actual_entry_price + (effective_stops_level + 10) * point
+                                            else:
+                                                tp_price = actual_entry_price - (effective_stops_level + 10) * point
+                                            tp_price = self.normalize_price(tp_price, digits)
 
-                positions = mt5.positions_get(symbol=symbol)
+                                        logger.info(
+                                            f"🔄 调整后的止盈止损: SL={sl_price:.{digits}f}, TP={tp_price:.{digits}f}")
+                                    break
 
-                if positions:
+                        if setup_success:
+                            break
+                else:
+                    logger.info(f"✅ 止盈止损设置成功: SL:{sl_price:.{digits}f} TP:{tp_price:.{digits}f}")
+                    setup_success = True
+                    # 记录已设置止盈止损的持仓，避免重复设置
+                    self.sl_tp_set_positions.add(position_ticket)
+                    break
 
+                # 如果失败，重新获取最新价格并重新计算
+                if retry_count < max_retries - 1 and not setup_success:
+                    logger.info(f"🔄 重新获取最新价格并重新计算止盈止损...")
+                    time.sleep(0.3)  # 等待价格更新
+
+                    # 重新获取最新价格和持仓信息
+                    current_tick = mt5.symbol_info_tick(symbol)
+                    positions = mt5.positions_get(symbol=symbol)
+
+                    if not current_tick or not positions:
+                        logger.warning(f"⚠️ 无法获取最新价格或持仓信息，放弃重试")
+                        break
+
+                    # 获取最新价格
+                    current_ask = DataSourceValidator._get_tick_value(current_tick, 'ask')
+                    current_bid = DataSourceValidator._get_tick_value(current_tick, 'bid')
+                    current_spread_points = (current_ask - current_bid) / point
+
+                    # 找到对应的持仓
+                    actual_position = None
                     for pos in positions:
-
-                        if pos.type == order_type and abs(pos.price_open - entry_price) < point * 10:
-
-                            modify_request["position"] = pos.ticket
-
-                            modify_result = mt5.order_send(modify_request)
-
-                            if modify_result is None:
-
-                                error_code = mt5.last_error()
-
-                                logger.warning(
-                                    f"⚠️ 重试后仍失败: order_send返回None，错误代码: {error_code[0]} - {error_code[1]}")
-
-                            elif modify_result.retcode == mt5.TRADE_RETCODE_DONE:
-
-                                logger.info(f"✅ 重试后止盈止损设置成功: SL:{sl_price:.2f} TP:{tp_price:.2f}")
-
-                            else:
-
-                                logger.warning(f"⚠️ 重试后仍失败: {modify_result.retcode} - {modify_result.comment}")
-
+                        if pos.ticket == position_ticket:
+                            actual_position = pos
                             break
 
-            elif modify_result.retcode == mt5.TRADE_RETCODE_DONE:
+                    if not actual_position:
+                        logger.warning(f"⚠️ 未找到持仓 {position_ticket}，放弃重试")
+                        break
 
-                logger.info(f"✅ 止盈止损设置成功: SL:{sl_price:.2f} TP:{tp_price:.2f}")
+                    # 重新计算最小距离（使用最新点差）
+                    new_stops_level = stops_level
+                    if new_stops_level <= 0:
+                        new_stops_level = max(10, min(50, int(current_spread_points * 5)))
 
-            else:
+                    # 应用更大的安全边际（重试时增加50%）
+                    retry_safety_margin = 1.5 if retry_count == 0 else 2.0
+                    retry_slippage_buffer = 50  # 重试时增加滑点缓冲
+                    new_effective_stops_level = int(new_stops_level * retry_safety_margin) + retry_slippage_buffer
 
-                logger.warning(f"⚠️ 止盈止损设置失败: {modify_result.retcode} - {modify_result.comment}")
+                    logger.info(
+                        f"🔄 重新计算: 最新点差={current_spread_points:.1f}点, 新安全距离={new_effective_stops_level}点 (安全边际={retry_safety_margin:.0%})")
 
-                # 如果失败，再等待一下并重试
+                    # 使用实际入场价格重新计算止盈止损
+                    actual_entry = actual_position.price_open
 
-                time.sleep(0.2)
+                    # 重新计算止损
+                    if sl_price > 0:
+                        if signal['direction'] == 'BUY':
+                            sl_price = actual_entry - new_effective_stops_level * point
+                        else:  # SELL
+                            sl_price = actual_entry + new_effective_stops_level * point
+                        sl_price = self.normalize_price(sl_price, digits)
 
-                positions = mt5.positions_get(symbol=symbol)
+                    # 重新计算止盈
+                    if tp_price > 0:
+                        if signal['direction'] == 'BUY':
+                            tp_price = actual_entry + new_effective_stops_level * point
+                        else:  # SELL
+                            tp_price = actual_entry - new_effective_stops_level * point
+                        tp_price = self.normalize_price(tp_price, digits)
 
-                if positions:
+                    logger.info(f"🔄 重新计算的止盈止损: SL={sl_price:.{digits}f}, TP={tp_price:.{digits}f}")
 
-                    for pos in positions:
+                    # 更新请求
+                    modify_request = {
+                        "action": mt5.TRADE_ACTION_SLTP,
+                        "symbol": symbol,
+                        "position": position_ticket,
+                    }
+                    if sl_price > 0:
+                        modify_request["sl"] = sl_price
+                    if tp_price > 0:
+                        modify_request["tp"] = tp_price
 
-                        if pos.type == order_type and abs(pos.price_open - entry_price) < point * 10:
+                    # 重试
+                    modify_result = mt5.order_send(modify_request)
+                    retry_count += 1
+                else:
+                    # 重试次数用完，记录最终错误
+                    if not setup_success:
+                        logger.error(
+                            f"❌ 止盈止损设置失败，已重试{max_retries}次，放弃设置。订单号: {order_ticket}, 持仓号: {position_ticket}")
+                        # 即使失败也继续，不阻止开仓成功
+                        break
 
-                            modify_request["position"] = pos.ticket
-
-                            modify_result = mt5.order_send(modify_request)
-
-                            if modify_result is None:
-
-                                error_code = mt5.last_error()
-
-                                logger.warning(
-                                    f"⚠️ 重试后仍失败: order_send返回None，错误代码: {error_code[0]} - {error_code[1]}")
-
-                            elif modify_result.retcode == mt5.TRADE_RETCODE_DONE:
-
-                                logger.info(f"✅ 重试后止盈止损设置成功: SL:{sl_price:.2f} TP:{tp_price:.2f}")
-
-                            else:
-
-                                logger.warning(f"⚠️ 重试后仍失败: {modify_result.retcode} - {modify_result.comment}")
-
-                            break
+            if not setup_success:
+                logger.warning(f"⚠️ 止盈止损设置未成功，但开仓已完成。订单号: {order_ticket}, 持仓号: {position_ticket}")
+                logger.warning(f"   建议手动检查并设置止盈止损: SL={sl_price:.{digits}f}, TP={tp_price:.{digits}f}")
 
             self.daily_trades += 1
 
@@ -3215,6 +4838,9 @@ class ProfessionalPositionManager:
 
             entry_price = position['price_open']
 
+            if entry_price <= 0 or current_price <= 0:
+                return
+
             current_sl = position.get('sl', 0)
 
             if position['type'] == 'BUY':
@@ -3223,21 +4849,39 @@ class ProfessionalPositionManager:
 
                 if profit_percent >= activation_percent:
 
-                    new_sl = current_price - step_size * entry_price
+                    # 计算新的止损价格（使用点数而不是百分比）
+                    symbol_info = self.data_engine.data_validator.symbol_info
+                    if symbol_info:
+                        point = symbol_info.point
+                        # step_size是百分比，转换为点数
+                        step_points = step_size * entry_price / point
+                        new_sl = current_price - step_points * point
 
-                    if new_sl > current_sl:
-                        self._modify_stop_loss(ticket, new_sl)
+                        # 确保新止损高于当前止损（或当前没有止损）
+                        if new_sl > current_sl or current_sl == 0:
+                            # 确保新止损不会高于入场价
+                            if new_sl < entry_price:
+                                self._modify_stop_loss(ticket, new_sl)
 
-            else:
+            else:  # SELL
 
                 profit_percent = (entry_price - current_price) / entry_price
 
                 if profit_percent >= activation_percent:
 
-                    new_sl = current_price + step_size * entry_price
+                    # 计算新的止损价格
+                    symbol_info = self.data_engine.data_validator.symbol_info
+                    if symbol_info:
+                        point = symbol_info.point
+                        # step_size是百分比，转换为点数
+                        step_points = step_size * entry_price / point
+                        new_sl = current_price + step_points * point
 
-                    if new_sl < current_sl or current_sl == 0:
-                        self._modify_stop_loss(ticket, new_sl)
+                        # 确保新止损低于当前止损（或当前没有止损）
+                        if new_sl < current_sl or current_sl == 0:
+                            # 确保新止损不会低于入场价
+                            if new_sl > entry_price:
+                                self._modify_stop_loss(ticket, new_sl)
 
         except Exception as e:
 
@@ -3248,10 +4892,39 @@ class ProfessionalPositionManager:
         """修改止损"""
 
         try:
+            symbol = self.data_engine.symbol
+            symbol_info = self.data_engine.data_validator.symbol_info
+
+            if not symbol_info:
+                logger.warning(f"⚠️ 无法获取品种信息，跳过修改止损")
+                return
+
+            # 规范化价格
+            digits = symbol_info.digits
+            new_sl = self.normalize_price(new_sl, digits)
+
+            # 获取当前持仓信息以验证止损价格
+            positions = mt5.positions_get(symbol=symbol)
+            if positions:
+                for pos in positions:
+                    if pos.ticket == ticket:
+                        entry_price = pos.price_open
+                        position_type = 'BUY' if pos.type == mt5.ORDER_TYPE_BUY else 'SELL'
+
+                        # 验证止损价格方向
+                        if position_type == 'BUY' and new_sl >= entry_price:
+                            logger.warning(f"⚠️ 止损价格无效（BUY订单止损应低于入场价），跳过修改")
+                            return
+                        elif position_type == 'SELL' and new_sl <= entry_price:
+                            logger.warning(f"⚠️ 止损价格无效（SELL订单止损应高于入场价），跳过修改")
+                            return
+                        break
 
             request = {
 
                 "action": mt5.TRADE_ACTION_SLTP,
+
+                "symbol": symbol,
 
                 "position": ticket,
 
@@ -3261,12 +4934,22 @@ class ProfessionalPositionManager:
 
             result = mt5.order_send(request)
 
+            if result is None:
+                error_code = mt5.last_error()
+                logger.warning(f"⚠️ 修改止损失败: order_send返回None，错误代码: {error_code[0]} - {error_code[1]}")
+                return
+
             if result.retcode == mt5.TRADE_RETCODE_DONE:
-                logger.debug(f"✅ 止损已更新: {ticket} -> {new_sl:.2f}")
+
+                logger.debug(f"✅ 止损已更新: {ticket} -> {new_sl:.{digits}f}")
+
+            else:
+
+                logger.warning(f"⚠️ 修改止损失败: {result.retcode} - {result.comment}")
 
         except Exception as e:
 
-            logger.debug(f"修改止损异常: {str(e)}")
+            logger.warning(f"修改止损异常: {str(e)}")
 
     def _check_multi_target_take_profit(self, ticket: int, position: Dict, current_price: float):
 
@@ -3318,6 +5001,18 @@ class ProfessionalPositionManager:
 
                 if target_reached:
 
+                    # 重新获取最新持仓信息（可能已经被部分平仓）
+                    positions = self.get_open_positions()
+                    if ticket not in positions:
+                        # 持仓已被完全平仓，清理多目标止盈信息
+                        if ticket in self.position_tp_targets:
+                            del self.position_tp_targets[ticket]
+                        return
+
+                    # 使用最新持仓信息
+                    latest_position = positions[ticket]
+                    current_volume = latest_position['volume']
+
                     # 计算需要平仓的手数
 
                     close_volume = current_volume * close_percent
@@ -3350,7 +5045,11 @@ class ProfessionalPositionManager:
 
                         if success:
 
-                            logger.info(f"🎯 达到止盈目标TP{i + 1} ({tp_price:.2f})，部分平仓: {close_volume}手")
+                            logger.info(
+                                f"🎯 达到止盈目标TP{i + 1} ({tp_price:.{symbol_info.digits if symbol_info else 2}f})，部分平仓: {close_volume}手")
+
+                            # 等待部分平仓完成
+                            time.sleep(0.3)
 
                             # 从目标列表中移除已触发的目标
 
@@ -3373,12 +5072,141 @@ class ProfessionalPositionManager:
                                 del self.position_tp_targets[ticket]
 
                             break  # 一次只处理一个目标
+                        else:
+                            logger.warning(f"⚠️ 部分平仓失败，无法执行止盈目标TP{i + 1}")
+                            break  # 平仓失败，等待下次检查
 
         except Exception as e:
 
             logger.error(f"检查多目标止盈异常: {str(e)}")
 
             traceback.print_exc()
+
+    def _close_position(self, ticket: int, position_type: str) -> bool:
+
+        """完全平仓"""
+
+        try:
+
+            symbol = self.data_engine.symbol
+
+            symbol_info = self.data_engine.data_validator.symbol_info
+
+            if not symbol_info:
+                return False
+
+            # 获取持仓信息以获取手数
+
+            positions = mt5.positions_get(symbol=symbol)
+
+            if not positions:
+                logger.warning(f"⚠️ 未找到持仓 {ticket}")
+
+                return False
+
+            position = None
+
+            for pos in positions:
+
+                if pos.ticket == ticket:
+                    position = pos
+
+                    break
+
+            if not position:
+                logger.warning(f"⚠️ 未找到持仓 {ticket}")
+
+                return False
+
+            volume = position.volume
+
+            # 获取当前价格
+
+            tick = mt5.symbol_info_tick(symbol)
+
+            if not tick:
+                return False
+
+            ask = DataSourceValidator._get_tick_value(tick, 'ask')
+
+            bid = DataSourceValidator._get_tick_value(tick, 'bid')
+
+            # 确定平仓价格和类型
+
+            if position_type == 'BUY':
+
+                close_price = bid  # BUY订单用bid价平仓
+
+                close_type = mt5.ORDER_TYPE_SELL  # 卖出平仓
+
+            else:
+
+                close_price = ask  # SELL订单用ask价平仓
+
+                close_type = mt5.ORDER_TYPE_BUY  # 买入平仓
+
+            # 发送平仓订单
+
+            request = {
+
+                "action": mt5.TRADE_ACTION_DEAL,
+
+                "symbol": symbol,
+
+                "volume": volume,
+
+                "type": close_type,
+
+                "position": ticket,  # 指定要平仓的持仓ticket
+
+                "price": close_price,
+
+                "deviation": 20,
+
+                "magic": 123456,
+
+                "comment": f"Close_Reversal",
+
+                "type_time": mt5.ORDER_TIME_GTC,
+
+            }
+
+            result = mt5.order_send(request)
+
+            if result is None:
+                error_code = mt5.last_error()
+
+                logger.warning(f"⚠️ 平仓失败: order_send返回None，错误代码: {error_code[0]} - {error_code[1]}")
+
+                return False
+
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+
+                logger.info(f"✅ 平仓成功: {volume}手 @ {close_price:.2f} (ticket: {ticket})")
+
+                # 清理相关记录
+
+                if ticket in self.position_tp_targets:
+                    del self.position_tp_targets[ticket]
+
+                if ticket in self.sl_tp_set_positions:
+                    self.sl_tp_set_positions.discard(ticket)
+
+                return True
+
+            else:
+
+                logger.warning(f"⚠️ 平仓失败: {result.retcode} - {result.comment}")
+
+                return False
+
+        except Exception as e:
+
+            logger.error(f"平仓异常: {str(e)}")
+
+            traceback.print_exc()
+
+            return False
 
     def _partial_close_position(self, ticket: int, volume: float, position_type: str) -> bool:
 
@@ -3502,6 +5330,7 @@ class ProfessionalPositionManager:
 
             # 获取最小止损距离
             point = symbol_info.point
+            digits = symbol_info.digits
             stops_level = 0
             try:
                 if hasattr(symbol_info, 'trade_stops_level'):
@@ -3513,7 +5342,7 @@ class ProfessionalPositionManager:
 
             if stops_level <= 0:
                 current_spread = (symbol_info.ask - symbol_info.bid) / point
-                stops_level = max(2, int(current_spread * 2))
+                stops_level = max(10, min(50, int(current_spread * 5)))
 
             # 验证止盈价格
             entry_price = position.price_open
@@ -3524,24 +5353,27 @@ class ProfessionalPositionManager:
                 tp_distance = (new_tp - entry_price) / point
                 # BUY订单：止盈应高于入场价，且距离至少为stops_level
                 if new_tp <= entry_price:
-                    logger.warning(f"⚠️ 止盈价格无效（BUY订单止盈应高于入场价 {entry_price:.2f}），跳过更新")
+                    logger.warning(f"⚠️ 止盈价格无效（BUY订单止盈应高于入场价 {entry_price:.{digits}f}），跳过更新")
                     return
                 if tp_distance < stops_level:
                     # 调整止盈价格
                     new_tp = entry_price + stops_level * point
-                    new_tp = round(new_tp / point) * point
+                    new_tp = self.normalize_price(new_tp, digits)
                     logger.debug(f"调整止盈价格以满足最小距离要求: {stops_level}点")
             else:  # SELL
                 tp_distance = (entry_price - new_tp) / point
                 # SELL订单：止盈应低于入场价，且距离至少为stops_level
                 if new_tp >= entry_price:
-                    logger.warning(f"⚠️ 止盈价格无效（SELL订单止盈应低于入场价 {entry_price:.2f}），跳过更新")
+                    logger.warning(f"⚠️ 止盈价格无效（SELL订单止盈应低于入场价 {entry_price:.{digits}f}），跳过更新")
                     return
                 if tp_distance < stops_level:
                     # 调整止盈价格
                     new_tp = entry_price - stops_level * point
-                    new_tp = round(new_tp / point) * point
+                    new_tp = self.normalize_price(new_tp, digits)
                     logger.debug(f"调整止盈价格以满足最小距离要求: {stops_level}点")
+
+            # 规范化止盈价格
+            new_tp = self.normalize_price(new_tp, digits)
 
             request = {
 
@@ -3629,8 +5461,37 @@ class ProfessionalComplexStrategy:
             # 主交易循环
 
             last_analysis_time = 0
+            last_heartbeat_time = time.time()
+            heartbeat_interval = 10.0  # 每10秒输出一次心跳日志
+            last_diagnostic_time = 0
+            diagnostic_interval = 30.0  # 每30秒输出一次诊断信息
 
             analysis_interval = 1.0  # 每秒分析一次
+
+            logger.info("🔄 进入主交易循环，开始处理数据...")
+
+            # 立即执行一次市场状态分析，显示初始状态
+            try:
+                market_state, state_confidence = self.market_analyzer.analyze_complex_market_state()
+                indicators = self.data_engine.calculate_complex_indicators()
+                if indicators:
+                    current_price = indicators.get('CURRENT_PRICE', 0)
+                    # 显示所有状态的原始概率
+                    raw_probs = {
+                        'TRENDING': self.market_analyzer._calculate_trending_probability(indicators),
+                        'RANGING': self.market_analyzer._calculate_ranging_probability(indicators),
+                        'VOLATILE': self.market_analyzer._calculate_volatile_probability(indicators),
+                    }
+                    logger.info(
+                        f"📊 初始市场状态: {market_state} (置信度: {state_confidence:.2f}), 当前价格: {current_price:.2f}")
+                    logger.info(f"   原始概率: TRENDING={raw_probs['TRENDING']:.3f}, "
+                                f"RANGING={raw_probs['RANGING']:.3f}, "
+                                f"VOLATILE={raw_probs['VOLATILE']:.3f}")
+                else:
+                    logger.warning(f"⚠️ 初始状态分析: 无法计算技术指标")
+            except Exception as init_error:
+                logger.warning(f"⚠️ 初始状态分析异常: {str(init_error)}")
+                traceback.print_exc()
 
             while self.running:
 
@@ -3638,30 +5499,90 @@ class ProfessionalComplexStrategy:
 
                     current_time = time.time()
 
+                    # 心跳日志（每10秒输出一次，确认程序在运行）
+                    if current_time - last_heartbeat_time >= heartbeat_interval:
+                        tick_count = len(self.data_engine.tick_buffer)
+                        logger.info(
+                            f"💓 程序运行中... Tick缓冲区: {tick_count}个, 数据引擎已初始化: {self.data_engine.initialized}")
+                        last_heartbeat_time = current_time
+
                     # 处理Tick数据
 
-                    self.data_engine.process_tick_data()
+                    tick_result = self.data_engine.process_tick_data()
+                    if not tick_result:
+                        # 如果处理失败，等待一下再继续
+                        time.sleep(ProfessionalComplexConfig.PROCESSING_INTERVAL)
+                        continue
 
                     # 定期分析（降低频率）
 
                     if current_time - last_analysis_time >= analysis_interval:
 
-                        # 更新账户信息
+                        try:
+                            # 更新账户信息
 
-                        self.risk_manager.update_account_info()
+                            self.risk_manager.update_account_info()
 
-                        # 更新持仓状态
+                            # 更新持仓状态
 
-                        self.position_manager.update_positions()
+                            self.position_manager.update_positions()
 
-                        # 生成交易信号
+                            # 生成交易信号
 
-                        signal = self.signal_generator.generate_trading_signal()
+                            signal = self.signal_generator.generate_trading_signal()
 
-                        if signal:
-                            # 尝试开仓
+                            if signal:
 
-                            self.position_manager.open_position(signal)
+                                # 尝试开仓
+                                logger.info(
+                                    f"🔍 准备开仓: {signal.get('direction')} 强度: {signal.get('strength', 0):.2f} 价格: {signal.get('entry_price', 0):.2f}")
+                                order_ticket = self.position_manager.open_position(signal)
+                                if order_ticket:
+                                    logger.info(f"✅ 开仓成功，订单号: {order_ticket}")
+                                else:
+                                    logger.info(f"⏸️ 开仓未执行（可能被can_open_new_position阻止）")
+                            else:
+                                # 如果没有信号，记录详细信息（降低频率）
+                                if current_time - last_diagnostic_time >= diagnostic_interval:
+                                    try:
+                                        market_state, state_confidence = self.market_analyzer.analyze_complex_market_state()
+                                        indicators = self.data_engine.calculate_complex_indicators()
+                                        current_tick = self.data_engine.tick_buffer[
+                                            -1] if self.data_engine.tick_buffer else None
+
+                                        if indicators and current_tick:
+                                            current_price = indicators.get('CURRENT_PRICE',
+                                                                           current_tick.get('mid_price', 0))
+                                            # 显示一些关键指标
+                                            rsi_14 = indicators.get('RSI_14', 'N/A')
+                                            adx = indicators.get('ADX', 'N/A')
+                                            ema_alignment = indicators.get('EMA_ALIGNMENT', 'N/A')
+                                            # 获取所有状态的原始概率用于诊断
+                                            raw_probs = {
+                                                'TRENDING': self.market_analyzer._calculate_trending_probability(
+                                                    indicators),
+                                                'RANGING': self.market_analyzer._calculate_ranging_probability(
+                                                    indicators),
+                                                'VOLATILE': self.market_analyzer._calculate_volatile_probability(
+                                                    indicators),
+                                            }
+                                            logger.info(f"📊 市场状态: {market_state} (置信度: {state_confidence:.2f}), "
+                                                        f"价格: {current_price:.2f}, "
+                                                        f"RSI14: {rsi_14}, ADX: {adx}, EMA对齐: {ema_alignment}")
+                                            logger.info(f"   原始概率: TRENDING={raw_probs['TRENDING']:.3f}, "
+                                                        f"RANGING={raw_probs['RANGING']:.3f}, "
+                                                        f"VOLATILE={raw_probs['VOLATILE']:.3f}, "
+                                                        f"未生成交易信号")
+                                        else:
+                                            logger.warning(f"⚠️ 无法获取指标或Tick数据，无法生成信号")
+                                        last_diagnostic_time = current_time
+                                    except Exception as diag_error:
+                                        logger.warning(f"⚠️ 诊断信息获取异常: {str(diag_error)}")
+                                        last_diagnostic_time = current_time
+
+                        except Exception as e:
+                            logger.error(f"⚠️ 分析阶段异常: {str(e)}")
+                            traceback.print_exc()
 
                         last_analysis_time = current_time
 
@@ -3682,6 +5603,9 @@ class ProfessionalComplexStrategy:
                     traceback.print_exc()
 
                     time.sleep(1)
+
+                    # 即使异常也继续运行，避免程序停止
+                    logger.info("🔄 异常处理后继续运行...")
 
         except Exception as e:
 
