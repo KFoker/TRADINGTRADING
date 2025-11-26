@@ -1694,13 +1694,11 @@ class ProfessionalTickDataEngine:
             return None
 
     def _calculate_timeframe_emas(self) -> Dict[str, Dict[str, float]]:
-        """计算多时间框架EMA（5分钟、15分钟、30分钟、60分钟）"""
+        """计算多时间框架EMA（只使用M1和M5时间框架）"""
         timeframe_emas = {}
         timeframes = {
-            'M5': mt5.TIMEFRAME_M5,
-            'M15': mt5.TIMEFRAME_M15,
-            'M30': mt5.TIMEFRAME_M30,
-            'M60': mt5.TIMEFRAME_H1  # 使用H1代替M60（MT5没有TIMEFRAME_M60）
+            'M1': mt5.TIMEFRAME_M1,  # 1分钟
+            'M5': mt5.TIMEFRAME_M5  # 5分钟
         }
 
         for tf_name, tf_value in timeframes.items():
@@ -1736,6 +1734,7 @@ class ProfessionalTickDataEngine:
 
     def _check_ema_trend_alignment(self, timeframe_emas: Dict[str, Dict[str, float]]) -> Dict[str, Any]:
         """检查多时间框架EMA趋势排列（用户标准）
+        只使用M1和M5时间框架的MA5、15、30、60进行判断
         多头趋势：MA5 > MA15 > MA30 > MA60
         空头趋势：MA5 < MA15 < MA30 < MA60
         震荡市：其他情况
@@ -1746,8 +1745,8 @@ class ProfessionalTickDataEngine:
             'details': {}
         }
 
-        # 优先检查M5（5分钟）时间框架
-        for tf_name in ['M5', 'M15', 'M30', 'M60']:
+        # 优先检查M1（1分钟）时间框架，然后检查M5（5分钟）
+        for tf_name in ['M1', 'M5']:
             if tf_name not in timeframe_emas:
                 continue
 
@@ -1788,8 +1787,8 @@ class ProfessionalTickDataEngine:
                 if int(current_time) % 30 == 0:
                     logger.info(
                         f"✅ [{tf_name}] 判断为多头趋势: MA5({ma5:.2f}) > MA15({ma15:.2f}) > MA30({ma30:.2f}) > MA60({ma60:.2f})")
-                # 找到明确趋势后，优先返回M5的结果
-                if tf_name == 'M5':
+                # 找到明确趋势后，优先返回M1的结果
+                if tf_name == 'M1':
                     break
 
             elif is_bearish:
@@ -1805,8 +1804,8 @@ class ProfessionalTickDataEngine:
                 if int(current_time) % 30 == 0:
                     logger.info(
                         f"✅ [{tf_name}] 判断为空头趋势: MA5({ma5:.2f}) < MA15({ma15:.2f}) < MA30({ma30:.2f}) < MA60({ma60:.2f})")
-                # 找到明确趋势后，优先返回M5的结果
-                if tf_name == 'M5':
+                # 找到明确趋势后，优先返回M1的结果
+                if tf_name == 'M1':
                     break
 
         return result
