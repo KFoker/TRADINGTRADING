@@ -5867,7 +5867,7 @@ class RLSignalQualityEvaluator:
 
             ml_quality_score = signal.get('quality_score', 0.5)
 
-            combined_quality_score = (ml_quality_score * 0.6 + rl_quality_score * 0.4)
+            combined_quality_score = (ml_quality_score * 0.4 + rl_quality_score * 0.6)
 
             return {
 
@@ -5949,6 +5949,606 @@ class RLSignalQualityEvaluator:
 
             return None
 
+class AutoSignalFactorMiner:
+    """自动信号因子挖掘器 - 自动发现和评估交易信号因子"""
+    
+    def __init__(self, data_engine: ProfessionalTickDataEngine):
+        self.data_engine = data_engine
+        self.discovered_factors = []  # 发现的因子列表
+        self.factor_performance = {}  # 因子表现记录
+        self.factor_candidates = []  # 因子候选列表
+        
+        # 因子挖掘参数
+        self.min_factor_samples = 30  # 最小样本数才认为因子有效
+        self.min_factor_win_rate = 0.55  # 最小胜率
+        self.min_factor_sharpe = 0.5  # 最小夏普比率
+        self.min_factor_profit_factor = 1.2  # 最小盈亏比
+        
+        # 因子类型定义
+        self.factor_templates = self._init_factor_templates()
+        
+        # 历史信号数据（用于因子验证）
+        self.historical_signals = deque(maxlen=1000)
+        self.historical_indicators = deque(maxlen=1000)
+        self.historical_results = deque(maxlen=1000)
+        
+    def _init_factor_templates(self) -> List[Dict]:
+        """初始化因子模板"""
+        templates = []
+        
+        # 1. 技术指标组合因子
+        templates.extend([
+            {
+                'type': 'indicator_cross',
+                'name': 'RSI_Stoch_Cross',
+                'conditions': {
+                    'RSI_14': ('<', 30, '>', 70),
+                    'STOCH_K': ('<', 20, '>', 80),
+                    'MACD_HIST': ('>', 0, '<', 0)
+                },
+                'direction': ('BUY', 'SELL')
+            },
+            {
+                'type': 'indicator_alignment',
+                'name': 'EMA_MACD_Alignment',
+                'conditions': {
+                    'EMA_ALIGNMENT': ('>', 0.6, '<', -0.6),
+                    'MACD_TREND': ('>', 0.3, '<', -0.3),
+                    'ADX': ('>', 20, '>', 20)
+                },
+                'direction': ('BUY', 'SELL')
+            },
+            {
+                'type': 'bollinger_breakout',
+                'name': 'BB_Price_Breakout',
+                'conditions': {
+                    'BB_POSITION': ('<', 0.15, '>', 0.85),
+                    'PRICE_MOMENTUM': ('>', 0.0001, '<', -0.0001),
+                    'VOLUME_RATIO': ('>', 1.2, '>', 1.2)
+                },
+                'direction': ('BUY', 'SELL')
+            },
+            {
+                'type': 'trend_momentum',
+                'name': 'ADX_Momentum_Combo',
+                'conditions': {
+                    'ADX': ('>', 25, '>', 25),
+                    'PRICE_MOMENTUM': ('>', 0.0002, '<', -0.0002),
+                    'EMA_ALIGNMENT': ('>', 0.5, '<', -0.5)
+                },
+                'direction': ('BUY', 'SELL')
+            },
+            {
+                'type': 'reversal_pattern',
+                'name': 'RSI_Reversal',
+                'conditions': {
+                    'RSI_14': ('<', 25, '>', 75),
+                    'STOCH_K': ('<', 15, '>', 85),
+                    'MACD_HIST': ('>', -0.001, '<', 0.001)  # MACD接近零轴
+                },
+                'direction': ('BUY', 'SELL')
+            },
+            {
+                'type': 'volatility_breakout',
+                'name': 'ATR_BB_Breakout',
+                'conditions': {
+                    'ATR_PERCENT': ('>', 0.0005, '>', 0.0005),
+                    'BB_POSITION': ('<', 0.1, '>', 0.9),
+                    'ADX': ('>', 20, '>', 20)
+                },
+                'direction': ('BUY', 'SELL')
+            },
+            {
+                'type': 'kdj_cross',
+                'name': 'KDJ_Golden_Death_Cross',
+                'conditions': {
+                    'KDJ_K': ('>', 'KDJ_D', '<', 'KDJ_D'),
+                    'KDJ_K': ('<', 20, '>', 80),
+                    'RSI_14': ('<', 35, '>', 65)
+                },
+                'direction': ('BUY', 'SELL')
+            },
+            {
+                'type': 'multi_timeframe',
+                'name': 'Multi_TF_Alignment',
+                'conditions': {
+                    'EMA_ALIGNMENT': ('>', 0.7, '<', -0.7),
+                    'ADX': ('>', 22, '>', 22),
+                    'MACD_TREND': ('>', 0.4, '<', -0.4)
+                },
+                'direction': ('BUY', 'SELL')
+            }
+        ])
+        
+        return templates
+    
+    def mine_factors(self, indicators: Dict, market_state: str, 
+                    historical_signals: List[Dict]) -> List[Dict]:
+        """挖掘新的信号因子"""
+        try:
+            discovered = []
+            
+            # 1. 基于模板生成因子候选
+            for template in self.factor_templates:
+                factor = self._generate_factor_from_template(template, indicators, market_state)
+                if factor:
+                    # 验证因子有效性
+                    if self._validate_factor(factor, historical_signals):
+                        discovered.append(factor)
+            
+            # 2. 基于数据挖掘发现新因子（使用统计方法）
+            statistical_factors = self._mine_statistical_factors(indicators, historical_signals)
+            discovered.extend(statistical_factors)
+            
+            # 3. 评估因子质量
+            validated_factors = []
+            for factor in discovered:
+                evaluation = self._evaluate_factor_quality(factor, historical_signals)
+                if evaluation['is_valid']:
+                    factor['evaluation'] = evaluation
+                    validated_factors.append(factor)
+            
+            # 4. 更新发现的因子列表
+            for factor in validated_factors:
+                self._add_or_update_factor(factor)
+            
+            return validated_factors
+            
+        except Exception as e:
+            logger.warning(f"因子挖掘异常: {str(e)}")
+            return []
+    
+    def _generate_factor_from_template(self, template: Dict, indicators: Dict, 
+                                      market_state: str) -> Optional[Dict]:
+        """从模板生成因子"""
+        try:
+            conditions = template['conditions']
+            direction_options = template['direction']
+            
+            # 检查多头条件
+            buy_conditions_met = True
+            buy_conditions = {}
+            for key, condition in conditions.items():
+                if isinstance(condition, tuple) and len(condition) >= 2:
+                    op, threshold = condition[0], condition[1]
+                    indicator_value = indicators.get(key, None)
+                    
+                    if indicator_value is None:
+                        buy_conditions_met = False
+                        break
+                    
+                    # 处理相对比较（如 KDJ_K > KDJ_D）
+                    if isinstance(threshold, str) and threshold in indicators:
+                        threshold_value = indicators[threshold]
+                    else:
+                        threshold_value = threshold
+                    
+                    if op == '>':
+                        if not (indicator_value > threshold_value):
+                            buy_conditions_met = False
+                            break
+                        buy_conditions[key] = ('>', threshold_value)
+                    elif op == '<':
+                        if not (indicator_value < threshold_value):
+                            buy_conditions_met = False
+                            break
+                        buy_conditions[key] = ('<', threshold_value)
+                    elif op == '>=':
+                        if not (indicator_value >= threshold_value):
+                            buy_conditions_met = False
+                            break
+                        buy_conditions[key] = ('>=', threshold_value)
+                    elif op == '<=':
+                        if not (indicator_value <= threshold_value):
+                            buy_conditions_met = False
+                            break
+                        buy_conditions[key] = ('<=', threshold_value)
+            
+            # 检查空头条件
+            sell_conditions_met = True
+            sell_conditions = {}
+            for key, condition in conditions.items():
+                if isinstance(condition, tuple) and len(condition) >= 4:
+                    op, threshold = condition[2], condition[3]
+                    indicator_value = indicators.get(key, None)
+                    
+                    if indicator_value is None:
+                        sell_conditions_met = False
+                        break
+                    
+                    if isinstance(threshold, str) and threshold in indicators:
+                        threshold_value = indicators[threshold]
+                    else:
+                        threshold_value = threshold
+                    
+                    if op == '>':
+                        if not (indicator_value > threshold_value):
+                            sell_conditions_met = False
+                            break
+                        sell_conditions[key] = ('>', threshold_value)
+                    elif op == '<':
+                        if not (indicator_value < threshold_value):
+                            sell_conditions_met = False
+                            break
+                        sell_conditions[key] = ('<', threshold_value)
+            
+            factors = []
+            if buy_conditions_met:
+                factors.append({
+                    'name': f"{template['name']}_BUY",
+                    'type': template['type'],
+                    'direction': 'BUY',
+                    'conditions': buy_conditions,
+                    'market_state': market_state,
+                    'discovery_time': time.time()
+                })
+            
+            if sell_conditions_met:
+                factors.append({
+                    'name': f"{template['name']}_SELL",
+                    'type': template['type'],
+                    'direction': 'SELL',
+                    'conditions': sell_conditions,
+                    'market_state': market_state,
+                    'discovery_time': time.time()
+                })
+            
+            return factors[0] if factors else None
+            
+        except Exception as e:
+            logger.debug(f"从模板生成因子异常: {str(e)}")
+            return None
+    
+    def _mine_statistical_factors(self, indicators: Dict, 
+                                  historical_signals: List[Dict]) -> List[Dict]:
+        """使用统计方法挖掘因子"""
+        factors = []
+        
+        try:
+            if len(historical_signals) < self.min_factor_samples:
+                return factors
+            
+            # 分析历史信号的成功模式
+            profitable_signals = [s for s in historical_signals if s.get('was_profitable', False)]
+            unprofitable_signals = [s for s in historical_signals if not s.get('was_profitable', True)]
+            
+            if len(profitable_signals) < 10 or len(unprofitable_signals) < 10:
+                return factors
+            
+            # 提取指标特征
+            profitable_indicators = []
+            unprofitable_indicators = []
+            
+            for signal in profitable_signals[:100]:  # 限制样本数
+                if 'indicators' in signal:
+                    profitable_indicators.append(signal['indicators'])
+            
+            for signal in unprofitable_signals[:100]:
+                if 'indicators' in signal:
+                    unprofitable_indicators.append(signal['indicators'])
+            
+            if not profitable_indicators or not unprofitable_indicators:
+                return factors            
+            
+            # 找出显著差异的指标组合
+            key_indicators = ['RSI_14', 'ADX', 'EMA_ALIGNMENT', 'MACD_TREND', 
+                            'STOCH_K', 'BB_POSITION', 'ATR_PERCENT']
+            
+            for indicator in key_indicators:
+                if indicator not in indicators:
+                    continue
+                
+                # 计算盈利和亏损信号中该指标的均值
+                profitable_values = [ind.get(indicator, 0) for ind in profitable_indicators 
+                                   if indicator in ind]
+                unprofitable_values = [ind.get(indicator, 0) for ind in unprofitable_indicators 
+                                     if indicator in ind]
+                
+                if len(profitable_values) < 5 or len(unprofitable_values) < 5:
+                    continue
+                
+                profitable_mean = np.mean(profitable_values)
+                unprofitable_mean = np.mean(unprofitable_values)
+                
+                # 如果差异显著（>20%），创建因子
+                if abs(profitable_mean - unprofitable_mean) > abs(unprofitable_mean) * 0.2:
+                    current_value = indicators.get(indicator, 0)
+                    
+                    if profitable_mean > unprofitable_mean:
+                        # 多头因子：当指标高于阈值时盈利概率高
+                        threshold = profitable_mean * 0.9
+                        if current_value > threshold:
+                            factors.append({
+                                'name': f'Statistical_{indicator}_BUY',
+                                'type': 'statistical',
+                                'direction': 'BUY',
+                                'conditions': {indicator: ('>', threshold)},
+                                'market_state': 'ANY',
+                                'discovery_time': time.time(),
+                                'confidence': min(0.8, abs(profitable_mean - unprofitable_mean) / abs(unprofitable_mean))
+                            })
+                    else:
+                        # 空头因子：当指标低于阈值时盈利概率高
+                        threshold = profitable_mean * 1.1
+                        if current_value < threshold:
+                            factors.append({
+                                'name': f'Statistical_{indicator}_SELL',
+                                'type': 'statistical',
+                                'direction': 'SELL',
+                                'conditions': {indicator: ('<', threshold)},
+                                'market_state': 'ANY',
+                                'discovery_time': time.time(),
+                                'confidence': min(0.8, abs(profitable_mean - unprofitable_mean) / abs(unprofitable_mean))
+                            })
+        
+        except Exception as e:
+            logger.debug(f"统计因子挖掘异常: {str(e)}")
+        
+        return factors
+    
+    def _validate_factor(self, factor: Dict, historical_signals: List[Dict]) -> bool:
+        """验证因子有效性"""
+        if len(historical_signals) < self.min_factor_samples:
+            return False
+        
+        # 检查历史信号中是否有匹配该因子的信号
+        matching_signals = []
+        for signal in historical_signals[-200:]:  # 检查最近200个信号
+            if self._factor_matches_signal(factor, signal):
+                matching_signals.append(signal)
+        
+        if len(matching_signals) < self.min_factor_samples:
+            return False
+        
+        # 计算匹配信号的胜率
+        profitable_count = sum(1 for s in matching_signals if s.get('was_profitable', False))
+        win_rate = profitable_count / len(matching_signals) if matching_signals else 0
+        
+        if win_rate >= self.min_factor_win_rate:
+            factor['validation_win_rate'] = win_rate
+            factor['validation_samples'] = len(matching_signals)
+            return True
+        
+        return False
+    
+    def _factor_matches_signal(self, factor: Dict, signal: Dict) -> bool:
+        """检查信号是否匹配因子"""
+        if signal.get('direction') != factor.get('direction'):
+            return False
+        
+        # 检查条件是否匹配
+        if 'indicators' not in signal:
+            return False
+        
+        indicators = signal['indicators']
+        conditions = factor.get('conditions', {})
+        
+        for key, condition in conditions.items():
+            if key not in indicators:
+                return False
+            
+            op, threshold = condition[0], condition[1]
+            value = indicators[key]
+            
+            if op == '>' and not (value > threshold):
+                return False
+            elif op == '<' and not (value < threshold):
+                return False
+            elif op == '>=' and not (value >= threshold):
+                return False
+            elif op == '<=' and not (value <= threshold):
+                return False
+        
+        return True
+    
+    def _evaluate_factor_quality(self, factor: Dict, historical_signals: List[Dict]) -> Dict:
+        """评估因子质量"""
+        matching_signals = [s for s in historical_signals 
+                           if self._factor_matches_signal(factor, s)]
+        
+        if len(matching_signals) < self.min_factor_samples:
+            return {'is_valid': False, 'reason': 'insufficient_samples'}
+        
+        # 计算表现指标
+        profitable_trades = [s for s in matching_signals if s.get('was_profitable', False)]
+        win_rate = len(profitable_trades) / len(matching_signals)
+        
+        profits = [s.get('profit_usd', 0) for s in matching_signals]
+        total_profit = sum(profits)
+        avg_profit = np.mean(profits) if profits else 0
+        
+        # 计算盈亏比
+        positive_profits = [p for p in profits if p > 0]
+        negative_profits = [p for p in profits if p < 0]
+        avg_win = np.mean(positive_profits) if positive_profits else 0
+        avg_loss = abs(np.mean(negative_profits)) if negative_profits else 1
+        profit_factor = avg_win / avg_loss if avg_loss > 0 else 0
+        
+        # 计算夏普比率（简化版）
+        if len(profits) > 1:
+            sharpe = np.mean(profits) / (np.std(profits) + 1e-6) * np.sqrt(252)  # 年化
+        else:
+            sharpe = 0
+        
+        evaluation = {
+            'is_valid': (win_rate >= self.min_factor_win_rate and 
+                        profit_factor >= self.min_factor_profit_factor and
+                        sharpe >= self.min_factor_sharpe),
+            'win_rate': win_rate,
+            'total_trades': len(matching_signals),
+            'total_profit': total_profit,
+            'avg_profit': avg_profit,
+            'profit_factor': profit_factor,
+            'sharpe_ratio': sharpe,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss
+        }
+        
+        return evaluation
+    
+    def _add_or_update_factor(self, factor: Dict):
+        """添加或更新因子"""
+        factor_name = factor['name']
+        
+        if factor_name not in self.factor_performance:
+            self.discovered_factors.append(factor)
+            self.factor_performance[factor_name] = {
+                'factor': factor,
+                'total_trades': 0,
+                'profitable_trades': 0,
+                'total_profit': 0.0,
+                'win_rate': 0.0,
+                'last_used': 0
+            }
+        else:
+            # 更新因子（如果新因子表现更好）
+            evaluation = factor.get('evaluation', {})
+            existing_eval = self.factor_performance[factor_name].get('evaluation', {})
+            
+            if evaluation.get('win_rate', 0) > existing_eval.get('win_rate', 0):
+                self.factor_performance[factor_name]['factor'] = factor
+    
+    def generate_signals_from_factors(self, indicators: Dict, market_state: str) -> List[Dict]:
+        """基于挖掘到的因子生成信号"""
+        signals = []
+        
+        try:
+            # 按表现排序因子
+            sorted_factors = sorted(
+                self.discovered_factors,
+                key=lambda f: self.factor_performance.get(f['name'], {}).get('win_rate', 0),
+                reverse=True
+            )
+            
+            # 只使用前10个表现最好的因子
+            top_factors = sorted_factors[:10]
+            
+            for factor in top_factors:
+                # 检查因子条件是否满足
+                if self._check_factor_conditions(factor, indicators, market_state):
+                    signal = self._create_signal_from_factor(factor, indicators, market_state)
+                    if signal:
+                        signals.append(signal)
+            
+            return signals
+            
+        except Exception as e:
+            logger.warning(f"从因子生成信号异常: {str(e)}")
+            return []
+    
+    def _check_factor_conditions(self, factor: Dict, indicators: Dict, market_state: str) -> bool:
+        """检查因子条件是否满足"""
+        try:
+            # 检查市场状态
+            factor_market_state = factor.get('market_state', 'ANY')
+            if factor_market_state != 'ANY' and factor_market_state != market_state:
+                return False
+            
+            # 检查条件
+            conditions = factor.get('conditions', {})
+            for key, condition in conditions.items():
+                if key not in indicators:
+                    return False
+                
+                op, threshold = condition[0], condition[1]
+                value = indicators[key]
+                
+                # 处理相对比较
+                if isinstance(threshold, str) and threshold in indicators:
+                    threshold_value = indicators[threshold]
+                else:
+                    threshold_value = threshold
+                
+                if op == '>' and not (value > threshold_value):
+                    return False
+                elif op == '<' and not (value < threshold_value):
+                    return False
+                elif op == '>=' and not (value >= threshold_value):
+                    return False
+                elif op == '<=' and not (value <= threshold_value):
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            logger.debug(f"检查因子条件异常: {str(e)}")
+            return False
+    
+    def _create_signal_from_factor(self, factor: Dict, indicators: Dict, 
+                                  market_state: str) -> Optional[Dict]:
+        """从因子创建信号"""
+        try:
+            perf = self.factor_performance.get(factor['name'], {})
+            evaluation = factor.get('evaluation', {})
+            
+            # 计算信号强度（基于因子表现）
+            win_rate = perf.get('win_rate', evaluation.get('win_rate', 0.5))
+            base_strength = min(1.0, win_rate * 1.2)  # 将胜率转换为强度
+            
+            # 获取当前价格
+            current_price = indicators.get('CURRENT_PRICE', 0)
+            if current_price == 0:
+                current_tick = self.data_engine.tick_buffer[-1] if self.data_engine.tick_buffer else None
+                if current_tick:
+                    current_price = current_tick.get('mid_price', 0)
+            
+            if current_price == 0:
+                return None
+            
+            signal = {
+                'direction': factor['direction'],
+                'entry_price': current_price,
+                'strength': base_strength,
+                'signal_type': 'AUTO_MINED',
+                'factor_name': factor['name'],
+                'factor_type': factor.get('type', 'unknown'),
+                'market_state': market_state,
+                'timestamp': time.time(),
+                'indicators': indicators.copy(),
+                'quality_score': evaluation.get('win_rate', 0.5),
+                'success_probability': evaluation.get('win_rate', 0.5),
+                'recommendation': 'ACCEPT' if base_strength >= 0.5 else 'REVIEW'
+            }
+            
+            # 更新因子使用时间
+            perf['last_used'] = time.time()
+            
+            return signal
+            
+        except Exception as e:
+            logger.debug(f"从因子创建信号异常: {str(e)}")
+            return None
+    
+    def update_factor_performance(self, factor_name: str, was_profitable: bool, profit: float):
+        """更新因子表现"""
+        if factor_name in self.factor_performance:
+            perf = self.factor_performance[factor_name]
+            perf['total_trades'] += 1
+            if was_profitable:
+                perf['profitable_trades'] += 1
+                perf['total_profit'] += profit
+            perf['win_rate'] = perf['profitable_trades'] / perf['total_trades'] if perf['total_trades'] > 0 else 0
+    
+    def get_factor_report(self) -> Dict:
+        """获取因子挖掘报告"""
+        return {
+            'total_factors': len(self.discovered_factors),
+            'factors': [
+                {
+                    'name': f['name'],
+                    'type': f.get('type', 'unknown'),
+                    'direction': f.get('direction', 'UNKNOWN'),
+                    'performance': self.factor_performance.get(f['name'], {})
+                }
+                for f in self.discovered_factors
+            ],
+            'top_factors': sorted(
+                self.discovered_factors,
+                key=lambda f: self.factor_performance.get(f['name'], {}).get('win_rate', 0),
+                reverse=True
+            )[:5]
+        }
+
 class ProfessionalSignalGenerator:
 
     """专业信号生成器 - 基于市场状态和多重指标"""
@@ -5987,9 +6587,18 @@ class ProfessionalSignalGenerator:
 
         self.rl_quality_evaluator = RLSignalQualityEvaluator(data_engine)
 
+        # 初始化自动信号因子挖掘器
+
+        self.factor_miner = AutoSignalFactorMiner(data_engine)
+
         # 信号历史记录（用于RL训练）
 
         self.signal_history_with_results = deque(maxlen=500)
+        
+        # 因子挖掘相关
+        self.last_factor_mining_time = 0
+        self.factor_mining_interval = 300  # 每5分钟挖掘一次因子
+        self.auto_generated_signals_enabled = True  # 启用自动生成信号
 
     def generate_trading_signal(self) -> Optional[Dict[str, Any]]:
 
@@ -6016,6 +6625,44 @@ class ProfessionalSignalGenerator:
             # 获取市场状态
 
             market_state, state_confidence = self.market_analyzer.analyze_complex_market_state()
+            
+            # 定期挖掘因子
+            if current_time - self.last_factor_mining_time >= self.factor_mining_interval:
+                try:
+                    indicators = self.data_engine.calculate_complex_indicators()
+                    if indicators:
+                        historical_signals = list(self.signal_history_with_results)
+                        discovered_factors = self.factor_miner.mine_factors(
+                            indicators, market_state, historical_signals
+                        )
+                        if discovered_factors:
+                            logger.info(f"🔍 因子挖掘完成: 发现 {len(discovered_factors)} 个新因子")
+                            for factor in discovered_factors[:3]:  # 只显示前3个
+                                eval_info = factor.get('evaluation', {})
+                                logger.info(f"   因子: {factor['name']} - 胜率: {eval_info.get('win_rate', 0):.2%}, "
+                                          f"盈亏比: {eval_info.get('profit_factor', 0):.2f}")
+                        self.last_factor_mining_time = current_time
+                except Exception as mining_error:
+                    logger.warning(f"因子挖掘异常: {str(mining_error)}")
+            
+            # 尝试使用挖掘到的因子生成信号（优先）
+            if self.auto_generated_signals_enabled:
+                try:
+                    indicators = self.data_engine.calculate_complex_indicators()
+                    if indicators:
+                        auto_signals = self.factor_miner.generate_signals_from_factors(
+                            indicators, market_state
+                        )
+                        if auto_signals:
+                            # 选择最强的自动生成信号
+                            best_auto_signal = max(auto_signals, key=lambda s: s.get('strength', 0))
+                            if best_auto_signal.get('strength', 0) >= 0.5:  # 至少50%强度
+                                logger.info(f"🤖 使用自动挖掘因子生成信号: {best_auto_signal.get('factor_name')} "
+                                          f"强度: {best_auto_signal.get('strength', 0):.2f}")
+                                # 对自动生成的信号进行评估
+                                return self._evaluate_and_enhance_signal(best_auto_signal, indicators, market_state, state_confidence)
+                except Exception as auto_error:
+                    logger.debug(f"自动信号生成异常: {str(auto_error)}")
 
             # 降低置信度阈值，因为归一化后概率可能较低
 
@@ -6193,11 +6840,11 @@ class ProfessionalSignalGenerator:
 
                         if rl_evaluation.get('combined_quality_score'):
 
-                            # 综合评分：ML占60%，RL占40%
+                            # 综合评分：RL占60%，ML占40%
 
-                            combined_score = (ml_evaluation['quality_score'] * 0.6 + 
+                            combined_score = (ml_evaluation['quality_score'] * 0.4 + 
 
-                                             rl_evaluation['combined_quality_score'] * 0.4)
+                                             rl_evaluation['combined_quality_score'] * 0.6)
 
                             signal['quality_score'] = combined_score
 
@@ -6491,6 +7138,66 @@ class ProfessionalSignalGenerator:
 
             logger.error(f"生成信号异常: {str(e)}")
 
+            return None
+    
+    def _evaluate_and_enhance_signal(self, signal: Dict, indicators: Dict, 
+                                    market_state: str, state_confidence: float) -> Optional[Dict]:
+        """评估和增强自动生成的信号"""
+        try:
+            # 使用ML评估信号质量
+            ml_evaluation = self.ml_evaluator.evaluate_signal(
+                signal, indicators, market_state, state_confidence, self.data_engine
+            )
+            
+            if not ml_evaluation:
+                return None
+            
+            # 将ML评估结果添加到信号中
+            signal['ml_evaluation'] = ml_evaluation
+            signal['quality_score'] = ml_evaluation['quality_score']
+            signal['success_probability'] = ml_evaluation['success_probability']
+            signal['recommendation'] = ml_evaluation['recommendation']
+            
+            # 使用RL评估信号质量（增强评估）
+            try:
+                rl_evaluation = self.rl_quality_evaluator.evaluate_signal_quality(
+                    signal, indicators, market_state
+                )
+                signal['rl_evaluation'] = rl_evaluation
+                
+                # 使用RL和ML的综合质量评分
+                if rl_evaluation.get('combined_quality_score'):
+                    combined_score = (ml_evaluation['quality_score'] * 0.4 + 
+                                     rl_evaluation['combined_quality_score'] * 0.6)
+                    signal['quality_score'] = combined_score
+                    signal['rl_quality_level'] = rl_evaluation.get('rl_quality_level', 'MEDIUM')
+            except Exception as rl_error:
+                logger.debug(f"RL评估异常: {str(rl_error)}")
+            
+            # 检查质量阈值
+            min_quality_score = 0.35  # 自动生成信号的质量阈值稍低
+            if signal['quality_score'] < min_quality_score:
+                logger.debug(f"自动生成信号质量不足: {signal['quality_score']:.2f} < {min_quality_score}")
+                return None
+            
+            # 添加市场状态信息
+            signal['market_state'] = market_state
+            signal['state_confidence'] = state_confidence
+            
+            # 记录信号历史
+            self.signal_history.append(signal)
+            self.last_signal_time = time.time()
+            
+            logger.info(f"🤖 自动生成信号已评估: {signal.get('factor_name')} "
+                      f"方向: {signal['direction']} "
+                      f"强度: {signal['strength']:.2f} "
+                      f"质量: {signal['quality_score']:.2f} "
+                      f"成功率: {signal['success_probability']:.2%}")
+            
+            return signal
+            
+        except Exception as e:
+            logger.warning(f"评估自动生成信号异常: {str(e)}")
             return None
 
     def _detect_trend_start(self, indicators: Dict, current_price: float) -> Optional[Dict]:
@@ -9007,17 +9714,36 @@ class ProfessionalPositionManager:
         """
 
         try:
-
-            current_price = position.get('price_current', 0)
+            # 确保持仓信息有效
+            if not position or 'price_open' not in position:
+                logger.debug(f"⚠️ 持仓信息无效，跳过净盈利计算")
+                return 0.0, 0.0
 
             entry_price = position['price_open']
-
             position_type = position['type']
-
             volume = position.get('volume', 0)
 
-            if current_price <= 0 or entry_price <= 0:
+            if entry_price <= 0:
+                logger.debug(f"⚠️ 入场价无效: {entry_price}")
+                return 0.0, 0.0
 
+            # 获取当前价格（优先使用position中的，否则从MT5获取）
+            current_price = position.get('price_current', 0)
+            
+            if current_price <= 0:
+                # 尝试从MT5获取最新价格
+                try:
+                    tick = mt5.symbol_info_tick(self.data_engine.symbol)
+                    if tick:
+                        if position_type == 'BUY':
+                            current_price = DataSourceValidator._get_tick_value(tick, 'bid')
+                        else:
+                            current_price = DataSourceValidator._get_tick_value(tick, 'ask')
+                except Exception as e:
+                    logger.debug(f"⚠️ 获取当前价格异常: {str(e)}")
+            
+            if current_price <= 0:
+                logger.debug(f"⚠️ 无法获取当前价格，跳过净盈利计算")
                 return 0.0, 0.0
 
             # 计算毛盈利
@@ -10446,6 +11172,14 @@ class ProfessionalPositionManager:
                                 if 'rl_quality_level' in signal:
 
                                     signal_info['rl_quality_level'] = signal['rl_quality_level']
+                                
+                                # 如果有自动挖掘因子信息，保存
+                                if 'factor_name' in signal:
+                                    signal_info['factor_name'] = signal['factor_name']
+                                if 'factor_type' in signal:
+                                    signal_info['factor_type'] = signal['factor_type']
+                                if 'signal_type' in signal:
+                                    signal_info['signal_type'] = signal['signal_type']
 
                                 self.position_signal_info[pos.ticket] = signal_info
 
@@ -11817,6 +12551,10 @@ class ProfessionalPositionManager:
             return
 
         try:
+            # 确保持仓信息有效
+            if not position or 'price_open' not in position:
+                logger.debug(f"⚠️ 订单{ticket}持仓信息无效，跳过回撤监控")
+                return
 
             current_price = position.get('price_current', 0)
 
@@ -11849,84 +12587,85 @@ class ProfessionalPositionManager:
             # 计算盈利百分比
             profit_pct = price_diff_usd / entry_price if entry_price > 0 else 0
 
-            # ========== 新增保护层：2-5美元盈利区间的回撤保护 ==========
-            # 当盈利超过2美元但不到5美元时，时刻关注回撤
-            # 当价格回撤到距离开仓价2美元时，立即平仓止盈
-            
-            # 检查峰值盈利是否在2-5美元区间
-            peak_profit_usd = 0
-            if ticket in self.position_peak_profit:
-                peak_info = self.position_peak_profit[ticket]
-                peak_profit_usd = peak_info.get('peak_profit_usd', price_diff_usd)
-            else:
-                # 如果还没有记录峰值，使用当前价格差作为峰值
-                peak_profit_usd = price_diff_usd
-            
-            # 如果峰值盈利在2-5美元区间，且当前价格差回撤到2美元或以下，立即平仓
-            if 2.0 < peak_profit_usd < 5.0:
-                if price_diff_usd <= 2.0:
-                    logger.warning(f"🛡️ 订单{ticket}触发2-5美元区间保护: "
-                                 f"峰值=${peak_profit_usd:.2f}, 当前价格差=${price_diff_usd:.2f} <= $2.00, "
-                                 f"入场价={entry_price:.2f}, 当前价={current_price:.2f}")
-                    
-                    # 立即平仓止盈
-                    self._close_position(ticket, position_type)
-                    
-                    logger.info(f"✅ 订单{ticket}因2-5美元区间回撤保护已平仓止盈")
-                    
-                    # 清理记录
-                    if ticket in self.position_peak_profit:
-                        del self.position_peak_profit[ticket]
-                    if ticket in self.dynamic_tp_positions:
-                        self.dynamic_tp_positions.discard(ticket)
-                    return  # 平仓后直接返回
-            # ========== 新增保护层结束 ==========
-
             config = ProfessionalComplexConfig.PROFIT_DRAWDOWN_CONTROL
             min_peak_usd = config['MIN_PEAK_PROFIT_USD']
             min_profit_pct = config.get('MIN_PROFIT_TO_PROTECT', 0.003)
 
-            # 检查是否达到最小盈利要求（美元或百分比）
+            # ========== 提前记录峰值（即使只有2美元也要记录，用于2-5美元区间保护） ==========
+            # 如果价格差达到2美元或以上，就开始记录峰值（不等待5美元）
+            if price_diff_usd >= 2.0:
+                if ticket not in self.position_peak_profit:
+                    # 首次达到2美元，立即记录为峰值
+                    self.position_peak_profit[ticket] = {
+                        'peak_profit_usd': price_diff_usd,
+                        'peak_price': current_price,
+                        'peak_profit_pct': profit_pct
+                    }
+                    logger.info(
+                        f"📊 订单{ticket}价格差达到${price_diff_usd:.2f}({profit_pct:.2%})，开始记录峰值 (入场价={entry_price:.2f}, 当前价={current_price:.2f})")
+                else:
+                    peak_info = self.position_peak_profit[ticket]
+                    # 更新峰值（价格差）
+                    if price_diff_usd > peak_info['peak_profit_usd']:
+                        peak_info['peak_profit_usd'] = price_diff_usd
+                        peak_info['peak_price'] = current_price
+                        peak_info['peak_profit_pct'] = profit_pct
+                        logger.info(
+                            f"📊 订单{ticket}价格差创新高: ${price_diff_usd:.2f}({profit_pct:.2%}) (入场价={entry_price:.2f}, 当前价={current_price:.2f})")
+            # ========== 峰值记录结束 ==========
+
+            # ========== 2-5美元盈利区间的回撤保护 ==========
+            # 当盈利超过2美元但不到5美元时，时刻关注回撤
+            # 当价格回撤到距离开仓价2美元或以下时，立即平仓止盈
+            if ticket in self.position_peak_profit:
+                peak_info = self.position_peak_profit[ticket]
+                peak_profit_usd = peak_info.get('peak_profit_usd', price_diff_usd)
+                
+                # 如果峰值盈利在2-5美元区间，且当前价格差回撤到2美元或以下，立即平仓
+                if 2.0 < peak_profit_usd < 5.0:
+                    if price_diff_usd <= 2.0:
+                        logger.warning(f"🛡️ 订单{ticket}触发2-5美元区间保护: "
+                                     f"峰值=${peak_profit_usd:.2f}, 当前价格差=${price_diff_usd:.2f} <= $2.00, "
+                                     f"入场价={entry_price:.2f}, 当前价={current_price:.2f}")
+                        
+                        # 立即平仓止盈
+                        self._close_position(ticket, position_type)
+                        
+                        logger.info(f"✅ 订单{ticket}因2-5美元区间回撤保护已平仓止盈")
+                        
+                        # 清理记录
+                        if ticket in self.position_peak_profit:
+                            del self.position_peak_profit[ticket]
+                        if ticket in self.dynamic_tp_positions:
+                            self.dynamic_tp_positions.discard(ticket)
+                        return  # 平仓后直接返回
+            # ========== 2-5美元保护结束 ==========
+
+            # 检查是否达到最小盈利要求（美元或百分比）- 用于常规回撤保护
             if price_diff_usd < min_peak_usd and profit_pct < min_profit_pct:
-                # 清理记录（如果之前有记录）
-
-                if ticket in self.position_peak_profit:
-
-                    del self.position_peak_profit[ticket]
-
+                # 如果价格差小于2美元，清理记录（2美元以上的记录保留用于2-5美元保护）
+                if price_diff_usd < 2.0 and ticket in self.position_peak_profit:
+                    peak_info = self.position_peak_profit[ticket]
+                    if peak_info.get('peak_profit_usd', 0) < 2.0:
+                        del self.position_peak_profit[ticket]
                 return
 
-            # 初始化或更新峰值价格差
-
+            # 如果峰值记录已存在，继续使用；否则如果达到最小盈利要求，创建记录
             if ticket not in self.position_peak_profit:
-
-                # 首次达到最小盈利，立即记录为峰值
-                self.position_peak_profit[ticket] = {
-
-                    'peak_profit_usd': price_diff_usd,
-                    'peak_price': current_price,
-                    'peak_profit_pct': profit_pct
-                }
-
-                logger.info(
-                    f"📊 订单{ticket}价格差达到${price_diff_usd:.2f}({profit_pct:.2%})，开始监控回撤 (入场价={entry_price:.2f}, 当前价={current_price:.2f})")
-            else:
-
-                peak_info = self.position_peak_profit[ticket]
-
-                # 更新峰值（价格差）
-
-                if price_diff_usd > peak_info['peak_profit_usd']:
-
-                    peak_info['peak_profit_usd'] = price_diff_usd
-
-                    peak_info['peak_price'] = current_price
-                    peak_info['peak_profit_pct'] = profit_pct
+                # 首次达到最小盈利（5美元），立即记录为峰值
+                if price_diff_usd >= min_peak_usd or profit_pct >= min_profit_pct:
+                    self.position_peak_profit[ticket] = {
+                        'peak_profit_usd': price_diff_usd,
+                        'peak_price': current_price,
+                        'peak_profit_pct': profit_pct
+                    }
                     logger.info(
-                        f"📊 订单{ticket}价格差创新高: ${price_diff_usd:.2f}({profit_pct:.2%}) (入场价={entry_price:.2f}, 当前价={current_price:.2f})")
+                        f"📊 订单{ticket}价格差达到${price_diff_usd:.2f}({profit_pct:.2%})，开始监控回撤 (入场价={entry_price:.2f}, 当前价={current_price:.2f})")
+                else:
+                    # 未达到最小盈利要求，不进行回撤监控
+                    return
             
             peak_info = self.position_peak_profit[ticket]
-
             peak_profit_usd = peak_info['peak_profit_usd']
 
             peak_profit_pct = peak_info.get('peak_profit_pct', peak_profit_usd / entry_price if entry_price > 0 else 0)
@@ -12049,47 +12788,193 @@ class ProfessionalPositionManager:
 
             for ticket, pos in positions.items():
 
-                # 1. 智能止盈调整（优先执行，动态保护利润）
+                try:
+                    # 0. 检查并补充止盈止损（如果缺失）
+                    self._ensure_sl_tp_set(ticket, pos)
 
-                self._smart_take_profit_adjustment(ticket, pos, indicators)
+                    # 1. 智能止盈调整（优先执行，动态保护利润）
+                    try:
+                        self._smart_take_profit_adjustment(ticket, pos, indicators)
+                    except Exception as e:
+                        logger.warning(f"⚠️ 订单{ticket}智能止盈调整异常: {str(e)}")
 
-                # 2. 监控盈利回撤（优先检查，保护已有盈利）
+                    # 2. 监控盈利回撤（优先检查，保护已有盈利）
+                    try:
+                        self._monitor_profit_drawdown(ticket, pos)
+                    except Exception as e:
+                        logger.error(f"❌ 订单{ticket}盈利回撤监控异常: {str(e)}")
+                        traceback.print_exc()  # 打印详细错误信息
 
-                self._monitor_profit_drawdown(ticket, pos)
+                    # 3. 检查多目标止盈（非动态止盈订单）
+                    if ticket not in self.dynamic_tp_positions:
+                        try:
+                            self._check_multi_target_take_profit(ticket, pos, current_price)
+                        except Exception as e:
+                            logger.warning(f"⚠️ 订单{ticket}多目标止盈检查异常: {str(e)}")
 
-                # 3. 检查多目标止盈（非动态止盈订单）
-
-                if ticket not in self.dynamic_tp_positions:
-
-                    self._check_multi_target_take_profit(ticket, pos, current_price)
-
-                # 4. 检测趋势衰竭（如果净盈利足够）
-
-                # 使用净盈利检查（_detect_trend_exhaustion内部会检查净盈利）
-
-                if self._detect_trend_exhaustion(ticket, pos, indicators):
-
+                    # 4. 检测趋势衰竭（如果净盈利足够）
+                    try:
+                        if self._detect_trend_exhaustion(ticket, pos, indicators):
                             # 趋势衰竭时，如果是动态止盈订单，收紧止盈
-
                             if ticket in self.dynamic_tp_positions:
-
                                 logger.info(f"⚠️ 订单{ticket}趋势衰竭，收紧动态止盈")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 订单{ticket}趋势衰竭检测异常: {str(e)}")
 
-                                # 动态止盈会在下次更新时自动收紧
+                    # 5. 动态止盈更新（单边明确趋势，最大化止盈目标并实时更新控制回撤）
+                    try:
+                        self._update_dynamic_take_profit(ticket, pos, indicators)
+                    except Exception as e:
+                        logger.warning(f"⚠️ 订单{ticket}动态止盈更新异常: {str(e)}")
 
-                # 4. 动态止盈更新（单边明确趋势，最大化止盈目标并实时更新控制回撤）
-
-                self._update_dynamic_take_profit(ticket, pos, indicators)
-
-                # 5. 更新跟踪止损
-
-                if ProfessionalComplexConfig.RISK_MANAGEMENT['STOP_LOSS']['TRAILING']['ACTIVATION_PERCENT'] > 0:
-
-                    self._update_trailing_stop(ticket, pos, current_price)
+                    # 6. 更新跟踪止损
+                    if ProfessionalComplexConfig.RISK_MANAGEMENT['STOP_LOSS']['TRAILING']['ACTIVATION_PERCENT'] > 0:
+                        try:
+                            self._update_trailing_stop(ticket, pos, current_price)
+                        except Exception as e:
+                            logger.warning(f"⚠️ 订单{ticket}跟踪止损更新异常: {str(e)}")
+                            
+                except Exception as e:
+                    logger.error(f"❌ 订单{ticket}更新处理异常: {str(e)}")
+                    traceback.print_exc()
 
         except Exception as e:
 
             logger.error(f"更新持仓异常: {str(e)}")
+            traceback.print_exc()
+
+    def _ensure_sl_tp_set(self, ticket: int, position: Dict):
+        """确保持仓已设置止盈止损，如果缺失则尝试补充设置"""
+        try:
+            # 如果已经设置过，跳过
+            if ticket in self.sl_tp_set_positions:
+                return
+            
+            # 检查当前持仓的止盈止损
+            current_sl = position.get('sl', 0)
+            current_tp = position.get('tp', 0)
+            
+            # 如果都有，标记为已设置
+            if current_sl > 0 and current_tp > 0:
+                self.sl_tp_set_positions.add(ticket)
+                return
+            
+            # 如果缺失，尝试补充设置
+            if current_sl == 0 or current_tp == 0:
+                logger.warning(f"⚠️ 订单{ticket}止盈止损缺失: SL={current_sl}, TP={current_tp}，尝试补充设置")
+                
+                # 获取信号信息（如果存在）
+                signal_info = self.position_signal_info.get(ticket, {})
+                if not signal_info:
+                    logger.warning(f"⚠️ 订单{ticket}缺少信号信息，无法自动补充止盈止损")
+                    return
+                
+                # 获取当前价格和入场价
+                entry_price = position.get('price_open', 0)
+                if entry_price <= 0:
+                    logger.warning(f"⚠️ 订单{ticket}入场价无效: {entry_price}")
+                    return
+                
+                # 获取当前价格
+                indicators = self.data_engine.calculate_complex_indicators()
+                if not indicators:
+                    return
+                
+                current_price = indicators.get('CURRENT_PRICE', 0)
+                if current_price <= 0:
+                    tick = mt5.symbol_info_tick(self.data_engine.symbol)
+                    if tick:
+                        if position['type'] == 'BUY':
+                            current_price = DataSourceValidator._get_tick_value(tick, 'bid')
+                        else:
+                            current_price = DataSourceValidator._get_tick_value(tick, 'ask')
+                
+                if current_price <= 0:
+                    logger.warning(f"⚠️ 订单{ticket}无法获取当前价格")
+                    return
+                
+                # 重新构建信号（简化版）
+                direction = position.get('type', signal_info.get('direction', 'BUY'))
+                signal = {
+                    'direction': direction,
+                    'strength': signal_info.get('strength', 0.5),
+                    'market_state': signal_info.get('market_state', 'UNCERTAIN'),
+                    'entry_price': entry_price
+                }
+                
+                # 计算止损止盈
+                symbol_info = self.data_engine.data_validator.symbol_info
+                if not symbol_info:
+                    return
+                
+                point = symbol_info.point
+                digits = symbol_info.digits
+                
+                # 计算止损距离
+                stop_loss_distance = self.risk_manager.calculate_stop_loss_distance(signal, entry_price)
+                
+                # 计算止损价格
+                if direction == 'BUY':
+                    sl_price = entry_price - stop_loss_distance * point
+                else:
+                    sl_price = entry_price + stop_loss_distance * point
+                
+                sl_price = self.normalize_price(sl_price, digits)
+                
+                # 计算止盈价格
+                tp_levels = self.risk_manager.calculate_take_profit_levels(signal, entry_price, sl_price)
+                if tp_levels and len(tp_levels) > 0:
+                    tp_price = tp_levels[0]['price']
+                else:
+                    # 如果没有计算到止盈，使用默认值（2倍止损距离）
+                    if direction == 'BUY':
+                        tp_price = entry_price + stop_loss_distance * point * 2
+                    else:
+                        tp_price = entry_price - stop_loss_distance * point * 2
+                
+                tp_price = self.normalize_price(tp_price, digits)
+                
+                # 验证价格有效性
+                if direction == 'BUY':
+                    if sl_price >= entry_price:
+                        sl_price = 0
+                    if tp_price <= entry_price:
+                        tp_price = 0
+                else:
+                    if sl_price <= entry_price:
+                        sl_price = 0
+                    if tp_price >= entry_price:
+                        tp_price = 0
+                
+                # 只设置缺失的部分
+                final_sl = current_sl if current_sl > 0 else sl_price
+                final_tp = current_tp if current_tp > 0 else tp_price
+                
+                # 如果至少有一个需要设置
+                if (final_sl != current_sl or final_tp != current_tp) and (final_sl > 0 or final_tp > 0):
+                    # 使用 order_send 修改订单
+                    modify_request = {
+                        "action": mt5.TRADE_ACTION_SLTP,
+                        "symbol": self.data_engine.symbol,
+                        "position": ticket,
+                        "sl": final_sl if final_sl > 0 else None,
+                        "tp": final_tp if final_tp > 0 else None,
+                    }
+                    
+                    # 移除None值
+                    modify_request = {k: v for k, v in modify_request.items() if v is not None}
+                    
+                    result = mt5.order_send(modify_request)
+                    
+                    if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                        logger.info(f"✅ 订单{ticket}成功补充止盈止损: SL={final_sl:.{digits}f}, TP={final_tp:.{digits}f}")
+                        self.sl_tp_set_positions.add(ticket)
+                    else:
+                        error_code = mt5.last_error() if result is None else result.retcode
+                        logger.warning(f"⚠️ 订单{ticket}补充止盈止损失败: {error_code}")
+                        
+        except Exception as e:
+            logger.warning(f"⚠️ 检查订单{ticket}止盈止损异常: {str(e)}")
 
     def _update_trailing_stop(self, ticket: int, position: Dict, current_price: float):
 
@@ -12672,6 +13557,20 @@ class ProfessionalPositionManager:
                                 signal_with_result.update(self.position_signal_info[ticket])
 
                             self.signal_generator.signal_history_with_results.append(signal_with_result)
+                            
+                            # 更新因子表现（如果是自动挖掘因子生成的信号）
+                            try:
+                                if hasattr(self, 'position_signal_info') and ticket in self.position_signal_info:
+                                    signal_info = self.position_signal_info[ticket]
+                                    factor_name = signal_info.get('factor_name')
+                                    if factor_name:
+                                        self.signal_generator.factor_miner.update_factor_performance(
+                                            factor_name, was_profitable, profit_usd
+                                        )
+                                        logger.debug(f"📊 更新因子表现: {factor_name} - "
+                                                   f"盈利: {was_profitable}, 利润: {profit_usd:.2f} USD")
+                            except Exception as factor_error:
+                                logger.debug(f"更新因子表现异常: {str(factor_error)}")
 
                         except Exception as e:
 
@@ -12990,6 +13889,10 @@ class ProfessionalComplexStrategy:
         
         # RL增量学习相关
         self.last_rl_incremental_time = 0  # RL增量学习时间戳
+        
+        # 因子挖掘相关
+        self.last_factor_mining_time = 0  # 因子挖掘时间戳
+        self.factor_mining_interval = 300  # 因子挖掘间隔（5分钟）
 
     def run_strategy(self):
 
@@ -13244,6 +14147,21 @@ class ProfessionalComplexStrategy:
                             traceback.print_exc()
 
                         last_analysis_time = current_time
+
+                        # 定期输出因子挖掘报告
+                        if current_time - self.last_factor_mining_time >= self.factor_mining_interval * 2:  # 每10分钟输出一次报告
+                            try:
+                                factor_report = self.signal_generator.factor_miner.get_factor_report()
+                                if factor_report['total_factors'] > 0:
+                                    logger.info(f"📊 因子挖掘报告: 共发现 {factor_report['total_factors']} 个因子")
+                                    top_factors = factor_report.get('top_factors', [])
+                                    for i, factor in enumerate(top_factors[:3], 1):  # 只显示前3个
+                                        perf = factor_report['factors'][i-1]['performance']
+                                        logger.info(f"   Top {i}: {factor['name']} - "
+                                                  f"胜率: {perf.get('win_rate', 0):.2%}, "
+                                                  f"总交易: {perf.get('total_trades', 0)}")
+                            except Exception as report_error:
+                                logger.debug(f"因子报告输出异常: {str(report_error)}")
 
                         # 定期训练ML模型（如果样本足够）
 
