@@ -20,18 +20,30 @@
   5) **持续学习**：因子挖掘（模板+数据驱动）、ML/RL 双重评估，持久化优质因子。
 - 结论：以**技术驱动的价格目标**替代**盈亏比驱动的价格目标**，配合高标准信号过滤与成本约束，可提升实际净 R:R，并降低“高成本环境下的过度交易”风险。
 
-### 全局数据流示意（Mermaid）
+### 全局数据流示意
+
+Mermaid 若未能渲染，请参考下方文本/ASCII 版。
+
 ```mermaid
 flowchart LR
-  A[Tick数据流] --> B[DataEngine<br/>指标计算]
-  B --> C[MarketStateAnalyzer<br/>市场状态/置信度]
-  C --> D[SignalGenerator<br/>因子优先/指标融合]
-  D --> E[ML/RL评估<br/>成功率/质量]
-  E --> F[RiskManager<br/>SL/TP/盈亏比/仓位]
-  F --> G[PositionManager<br/>开仓/跟踪/回撤保护]
-  G --> H[结果反馈<br/>训练ML/RL/因子表现]
+  A[Tick数据流] --> B[DataEngine 指标计算]
+  B --> C[MarketStateAnalyzer 状态/置信度]
+  C --> D[SignalGenerator 因子/指标融合]
+  D --> E[ML_RL评估 成功率/质量]
+  E --> F[RiskManager SL/TP/RR/仓位]
+  F --> G[PositionManager 开仓/跟踪/回撤保护]
+  G --> H[结果反馈 ML/RL/因子更新]
   H --> D
-  D --> I[AutoSignalFactorMiner<br/>因子挖掘+排序+持久化]
+  D --> I[AutoSignalFactorMiner 因子挖掘+持久化]
+```
+
+文本版：
+```
+Tick数据流 → DataEngine(指标) → MarketStateAnalyzer(状态+置信度)
+→ SignalGenerator(因子优先/指标融合) → ML/RL评估(成功率/质量)
+→ RiskManager(SL/TP/RR/仓位) → PositionManager(开仓/跟踪/回撤保护)
+→ 结果反馈(训练 ML/RL/因子表现) → SignalGenerator(闭环)
+并行：SignalGenerator → AutoSignalFactorMiner(挖掘/排序/持久化)
 ```
 
 ---
@@ -87,15 +99,23 @@ flowchart LR
 ```mermaid
 flowchart TD
   S1[市场状态判定] -->|置信度不足拒绝| S1X[返回]
-  S1 --> S2[因子信号优先<br/>score>=0.5 Top1]
+  S1 --> S2[因子信号优先 score>=0.5 Top1]
   S2 --> S3[指标融合/形态]
-  S3 --> S4[价格行为确认<br/>突破/回调/反弹]
-  S3 --> S5[成交量确认<br/>volume_ratio>=1.2 且方向一致]
-  S4 --> S6[ML 成功率过滤<br/>成功率>=60%]
+  S3 --> S4[价格行为确认 突破/回调/反弹]
+  S3 --> S5[成交量确认 volume_ratio>=1.2 且方向一致]
+  S4 --> S6[ML成功率过滤 >=60%]
   S5 --> S6
-  S6 --> S7[方向一致性>=50%]
-  S7 --> S8[质量阈值>=0.45]
+  S6 --> S7[方向一致性 >=50%]
+  S7 --> S8[质量阈值 >=0.45]
   S8 --> S9[输出信号供风控]
+```
+
+文本版：
+```
+市场状态→若置信度不足拒绝→因子信号(≥0.5, 取最优)→指标融合/形态
+→ 价格行为确认(突破/回调/反弹) & 成交量确认(≥1.2 且方向一致)
+→ ML 成功率过滤(≥60%) → 方向一致性(≥50%)
+→ 质量阈值(≥0.45) → 输出给风控
 ```
 
 - 价格行为：`BREAKOUT_UP/DOWN`，`PULLBACK_BUY`，`BOUNCE_SELL`，命中加权确认。
