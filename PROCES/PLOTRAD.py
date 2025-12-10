@@ -8354,6 +8354,10 @@ class ProfessionalSignalGenerator:
         direction = signal.get('direction', 'UNKNOWN')
         confirmation_score = 0.0
         confirmation_count = 0
+        # 预设标志位，后续用于逆势过滤
+        price_action_confirmed = False
+        volume_confirmed = False
+        volume_ratio = 1.0
 
         # 1. RSI确认
         rsi_14 = indicators.get('RSI_14', 50)
@@ -8409,7 +8413,6 @@ class ProfessionalSignalGenerator:
                 confirmation_count += 1
 
         # 7. 价格行为确认（突破、回调等）- 新增
-        price_action_confirmed = False
         if len(prices) >= 20:
             current_price = prices[-1]
 
@@ -8470,7 +8473,6 @@ class ProfessionalSignalGenerator:
 
         # 8. 成交量确认 - 增强版（确保成交量放大）
         volume_profile = indicators.get('VOLUME_PROFILE', {})
-        volume_confirmed = False
         if isinstance(volume_profile, dict):
             volume_ratio = volume_profile.get('volume_ratio', 1.0)
             volume_trend = volume_profile.get('volume_trend', 0)
@@ -8501,6 +8503,39 @@ class ProfessionalSignalGenerator:
         # 如果成交量未确认，记录警告
         if not volume_confirmed and volume_ratio < 1.2:
             signal['volume_warning'] = f'成交量未放大（比率: {volume_ratio:.2f} < 1.2）'
+
+        # 9. 逆势交易的额外约束（减少“关键反转做反”）
+        # 以EMA对齐与高周期趋势为基准，逆势时需同时满足价格行为+成交量确认，否则削弱信号
+        trend_bias = 'NEUTRAL'
+        if ema_alignment > 0.05:
+            trend_bias = 'BUY'
+        elif ema_alignment < -0.05:
+            trend_bias = 'SELL'
+
+        higher_tf_trend = indicators.get('HIGHER_TF_TREND', 'NEUTRAL')  # 例如 'BULL'/'BEAR'/...
+        if higher_tf_trend == 'BULL':
+            higher_tf_trend = 'BUY'
+        elif higher_tf_trend == 'BEAR':
+            higher_tf_trend = 'SELL'
+
+        is_counter_trend = (
+                (direction == 'BUY' and trend_bias == 'SELL') or
+                (direction == 'SELL' and trend_bias == 'BUY') or
+                (direction == 'BUY' and higher_tf_trend == 'SELL') or
+                (direction == 'SELL' and higher_tf_trend == 'BUY')
+        )
+
+        if is_counter_trend:
+            # 逆势单要求“价格行为”与“成交量”同时确认，且整体一致性需更高
+            counter_consistency = confirmation_score / max(1.0, confirmation_count * 0.15)
+            counter_ok = price_action_confirmed and volume_confirmed and counter_consistency >= 0.6
+            if not counter_ok:
+                # 明显削弱信号，降低被反方向“钓鱼”的概率
+                signal['strength'] = signal.get('strength', 0.5) * 0.6
+                signal['counter_trend_block'] = True
+                signal['direction_warning'] = '逆势信号缺乏充分确认，已降权'
+            else:
+                signal['counter_trend_block'] = False
 
         # 计算一致性比率
         consistency_ratio = confirmation_score / max(1.0, confirmation_count * 0.15)
@@ -10571,68 +10606,72 @@ class ComplexRiskManager:
                     f"📈 动态止盈：初始止盈={initial_tp:.2f} (ATR倍数={initial_atr_mult:.2f}, 距离=${initial_tp_distance:.2f})，后续将根据趋势强度动态调整")
                 return [{'price': initial_tp, 'close_percent': 1.0, 'dynamic': True}]
 
-            # 计算单一止盈目标（基于ATR和支撑阻力位，多目标止盈已禁用）
+                # 计算单一止盈目标（基于ATR和支撑阻力位，多目标止盈已禁用）
 
-            if direction == 'BUY':
+                if direction == 'BUY':
 
-                tp_price = entry_price + base_tp_distance
+                    tp_price = entry_price + base_tp_distance
 
-                # 如果阻力位有效，考虑阻力位
+                    # 如果阻力位有效，考虑阻力位
 
-                if resistance_level > 0 and resistance_level > entry_price:
+                    if resistance_level > 0 and resistance_level > entry_price:
 
-                    # 如果计算的止盈价格接近阻力位，调整到阻力位附近
+                        # 如果计算的止盈价格接近阻力位，调整到阻力位附近
 
-                    if abs(tp_price - resistance_level) < base_tp_distance * 0.3:
+                        if abs(tp_price - resistance_level) < base_tp_distance * 0.3:
 
-                        tp_price = resistance_level * 0.998  # 阻力位下方0.2%
+                            tp_price = resistance_level * 0.998  # 阻力位下方0.2%
 
-                    # 如果计算的止盈价格超过阻力位太多，限制在阻力位附近
+                        # 如果计算的止盈价格超过阻力位太多，限制在阻力位附近
 
-                    elif tp_price > resistance_level * 1.01:
+                        elif tp_price > resistance_level * 1.01:
 
-                        tp_price = resistance_level * 1.005  # 阻力位上方0.5%
+                            tp_price = resistance_level * 1.005  # 阻力位上方0.5%
 
-            else:  # SELL
+                else:  # SELL
 
-                tp_price = entry_price - base_tp_distance
+                    tp_price = entry_price - base_tp_distance
 
-            # 如果支撑位有效，考虑支撑位
+                # 如果支撑位有效，考虑支撑位
 
-            if support_level > 0 and support_level < entry_price:
+                if support_level > 0 and support_level < entry_price:
 
-                # 如果计算的止盈价格接近支撑位，调整到支撑位附近
+                    # 如果计算的止盈价格接近支撑位，调整到支撑位附近
 
-                if abs(tp_price - support_level) < base_tp_distance * 0.3:
+                    if abs(tp_price - support_level) < base_tp_distance * 0.3:
 
-                    tp_price = support_level * 1.002  # 支撑位上方0.2%
+                        tp_price = support_level * 1.002  # 支撑位上方0.2%
 
-                # 如果计算的止盈价格低于支撑位太多，限制在支撑位附近
+                    # 如果计算的止盈价格低于支撑位太多，限制在支撑位附近
 
-                elif tp_price < support_level * 0.99:
+                    elif tp_price < support_level * 0.99:
 
-                    tp_price = support_level * 0.995  # 支撑位下方0.5%
+                        tp_price = support_level * 0.995  # 支撑位下方0.5%
 
-            # 验证止盈价是否能覆盖手续费成本
-            # 如果技术分析得到的止盈价无法覆盖手续费，这个信号可能不适合开仓
-            # 这个检查会在开仓前验证盈亏比时进行，这里只记录警告
-            tp_distance_final = abs(tp_price - entry_price)
-            commission_per_lot = ProfessionalComplexConfig.COMMISSION_PER_LOT
-            min_profit_to_cover_cost = commission_per_lot * 1.5
+                # 验证止盈价是否能覆盖手续费成本
+                # 如果技术分析得到的止盈价无法覆盖手续费，这个信号可能不适合开仓
+                # 这个检查会在开仓前验证盈亏比时进行，这里只记录警告
+                tp_distance_final = abs(tp_price - entry_price)
+                commission_per_lot = ProfessionalComplexConfig.COMMISSION_PER_LOT
+                min_profit_to_cover_cost = commission_per_lot * 1.5
 
-            point = self.data_engine.data_validator.symbol_info.point if self.data_engine.data_validator.symbol_info else 0.01
-            tick_value = ProfessionalComplexConfig.POINT_VALUE
+                point = self.data_engine.data_validator.symbol_info.point if self.data_engine.data_validator.symbol_info else 0.01
+                tick_value = ProfessionalComplexConfig.POINT_VALUE
 
-            if tick_value > 0 and point > 0:
-                min_tp_distance_price = min_profit_to_cover_cost / (tick_value / point) if (
-                                                                                                       tick_value / point) > 0 else min_profit_to_cover_cost
-            else:
-                min_tp_distance_price = min_profit_to_cover_cost
+                if tick_value > 0 and point > 0:
+                    min_tp_distance_price = min_profit_to_cover_cost / (tick_value / point) if (
+                                                                                                           tick_value / point) > 0 else min_profit_to_cover_cost
+                else:
+                    min_tp_distance_price = min_profit_to_cover_cost
 
-            if tp_distance_final < min_tp_distance_price:
-                logger.warning(
-                    f"⚠️ 技术分析得到的止盈距离${tp_distance_final:.2f}可能不足以覆盖手续费成本${min_profit_to_cover_cost:.2f}，"
-                    f"将在盈亏比验证时检查")
+                if tp_distance_final < min_tp_distance_price:
+                    logger.warning(
+                        f"⚠️ 技术分析得到的止盈距离${tp_distance_final:.2f}可能不足以覆盖手续费成本${min_profit_to_cover_cost:.2f}，"
+                        f"将在盈亏比验证时检查")
+
+            # 若极端情况下未能确定tp_price，使用基础ATR距离兜底，避免未定义警告
+            if 'tp_price' not in locals():
+                tp_price = entry_price + base_tp_distance if direction == 'BUY' else entry_price - base_tp_distance
 
             logger.debug(f"📊 止盈计算: 信号强度={signal_strength:.2f}, 市场状态={market_state}, ADX={adx:.1f}, "
 
@@ -11608,80 +11647,42 @@ class ProfessionalPositionManager:
 
                     return False
 
-        # 检查短时间内价格差是否超过10美元（防止在相近价格连开多单）
+        # 检查价格差是否超过10美元（防止在相近价格连开多单，有持仓情况下无时间限制）
 
         # 注意：使用美元价格差而不是点数，因为点数会随手数不同而变化
 
         # 注意：只有在当前有持仓的情况下才检查价差限制，如果没有持仓则允许开新仓
+        # 有持仓情况下，无时间限制，只要价差不足就不允许开仓
 
         if len(self.open_positions) > 0 and self.last_trade_time > 0:
 
-            current_time = time.time()
-
-            time_diff = current_time - self.last_trade_time
-
-            min_time_interval = 180  # 3分钟 = 180秒
-
             min_price_diff_usd = 10.0  # 最小价差10美元
 
-            if time_diff < min_time_interval:
+            # 无时间限制，直接检查价差
 
-                # 在3分钟内，检查价差
+            current_price = signal.get('entry_price', 0)
 
-                current_price = signal.get('entry_price', 0)
+            if current_price > 0 and self.last_trade_price > 0:
 
-                if current_price > 0 and self.last_trade_price > 0:
+                # 直接计算美元价格差
 
-                    # 直接计算美元价格差
+                price_diff_usd = abs(current_price - self.last_trade_price)
 
-                    price_diff_usd = abs(current_price - self.last_trade_price)
+                if price_diff_usd < min_price_diff_usd:
 
-                    if price_diff_usd < min_price_diff_usd:
+                    logger.info(
+                        f"⏸️ [{new_direction}] 价差不足: 价差 ${price_diff_usd:.2f} < ${min_price_diff_usd:.2f} (要求至少10美元价差), "
 
-                        logger.info(f"⏸️ [{new_direction}] 短时间内价差不足: 距离上次开仓 {time_diff:.1f}秒, "
+                        f"上次价格: {self.last_trade_price:.2f}, 当前价格: {current_price:.2f}, "
 
-                                    f"价差 ${price_diff_usd:.2f} < ${min_price_diff_usd:.2f} (要求至少10美元价差), "
+                        f"上次方向: {self.last_trade_direction}")
 
-                                    f"上次价格: {self.last_trade_price:.2f}, 当前价格: {current_price:.2f}, "
+                    return False
 
-                                    f"上次方向: {self.last_trade_direction}")
+                else:
 
-                        return False
-
-                    else:
-
-                        logger.debug(
-                            f"✅ [{new_direction}] 价差检查通过: ${price_diff_usd:.2f} >= ${min_price_diff_usd:.2f}")
-            else:
-
-                # 超过3分钟，仍然检查价差（但时间限制更长，比如30分钟内）
-
-                extended_time_interval = 1800  # 30分钟 = 1800秒
-
-                if time_diff < extended_time_interval:
-
-                    current_price = signal.get('entry_price', 0)
-
-                    if current_price > 0 and self.last_trade_price > 0:
-
-                        # 直接计算美元价格差
-
-                        price_diff_usd = abs(current_price - self.last_trade_price)
-
-                        if price_diff_usd < min_price_diff_usd:
-
-                            logger.warning(
-                                f"⚠️ [{new_direction}] 30分钟内价差不足: 距离上次开仓 {time_diff / 60:.1f}分钟, "
-                                f"价差 ${price_diff_usd:.2f} < ${min_price_diff_usd:.2f} (要求至少10美元价差), "
-
-                                f"上次价格: {self.last_trade_price:.2f}, 当前价格: {current_price:.2f}")
-
-                            return False
-
-                        else:
-
-                            logger.debug(
-                                f"✅ [{new_direction}] 价差检查通过: ${price_diff_usd:.2f} >= ${min_price_diff_usd:.2f}")
+                    logger.debug(
+                        f"✅ [{new_direction}] 价差检查通过: ${price_diff_usd:.2f} >= ${min_price_diff_usd:.2f}")
 
         # 所有检查都通过
 
@@ -12270,30 +12271,28 @@ class ProfessionalPositionManager:
                     tp_price_for_calc = tp_price
 
                 # 重新计算手数（因为止损止盈可能已调整）
-
                 lot_size = self.risk_manager.calculate_position_size(signal, entry_price, sl_price, tp_price_for_calc)
 
                 # 使用调整后的手数和止盈价格验证净盈亏比（单一止盈）
-
+                is_valid_rr = False
+                actual_net_rr = 0.0
                 is_valid_rr, actual_net_rr = self.risk_manager.validate_risk_reward_ratio(
-
                     signal, entry_price, sl_price, tp_price_for_calc, lot_size, tp_levels=None
-
                 )
 
                 min_required_rr = ProfessionalComplexConfig.MIN_RISK_REWARD_RATIO
 
-            if not is_valid_rr:
-                # 单一止盈（分段止盈已禁用）
-                tp_display = f"{tp_price_for_calc:.{digits}f}"
-                logger.warning(
-                    f"❌ [{signal['direction']}] 调整止损止盈后净盈亏比不足，拒绝开仓: 实际净盈亏比={actual_net_rr:.2f}:1, "
-                    f"最小要求={min_required_rr:.2f}:1, 止盈={tp_display}")
+                if not is_valid_rr:
+                    # 单一止盈（分段止盈已禁用）
+                    tp_display = f"{tp_price_for_calc:.{digits}f}"
+                    logger.warning(
+                        f"❌ [{signal['direction']}] 调整止损止盈后净盈亏比不足，拒绝开仓: 实际净盈亏比={actual_net_rr:.2f}:1, "
+                        f"最小要求={min_required_rr:.2f}:1, 止盈={tp_display}")
 
-                return None
-            else:
-                logger.debug(f"✅ [{signal['direction']}] 调整后净盈亏比验证通过: {actual_net_rr:.2f}:1")
-                logger.info(f"📊 调整后重新计算仓位: {lot_size:.2f}手, 净盈亏比={actual_net_rr:.2f}:1")
+                    return None
+                else:
+                    logger.debug(f"✅ [{signal['direction']}] 调整后净盈亏比验证通过: {actual_net_rr:.2f}:1")
+                    logger.info(f"📊 调整后重新计算仓位: {lot_size:.2f}手, 净盈亏比={actual_net_rr:.2f}:1")
 
             # 第一步：先下单，不设置填充模式和止盈止损（避免填充模式问题）
 
@@ -13791,6 +13790,33 @@ class ProfessionalPositionManager:
             else:  # SELL
 
                 price_diff_usd = entry_price - current_price
+
+            # 基于初始风险的锁盈/追踪（减少“小盈大亏”）
+            current_sl = position.get('sl', 0)
+            risk_distance = abs(entry_price - current_sl) if current_sl else None
+            if risk_distance and risk_distance > 0:
+                # 1) 浮盈≥1R时，将潜在亏损压缩到约0.1R（接近保本但符合方向约束）
+                if price_diff_usd >= risk_distance:
+                    if position_type == 'BUY':
+                        candidate_sl = max(current_sl, entry_price - 0.1 * risk_distance)
+                        if candidate_sl > current_sl and candidate_sl < entry_price:
+                            self._modify_stop_loss(ticket, candidate_sl)
+                    else:
+                        candidate_sl = min(current_sl, entry_price + 0.1 * risk_distance)
+                        if candidate_sl < current_sl and candidate_sl > entry_price:
+                            self._modify_stop_loss(ticket, candidate_sl)
+                # 2) 浮盈≥1.5R时启动追踪：止损随价格推进，但仍保持与入场方向一致
+                if price_diff_usd >= 1.5 * risk_distance:
+                    if position_type == 'BUY':
+                        candidate_sl = min(current_price - 0.8 * risk_distance,
+                                           entry_price - 0.05 * risk_distance)
+                        if candidate_sl > current_sl and candidate_sl < current_price and candidate_sl < entry_price:
+                            self._modify_stop_loss(ticket, candidate_sl)
+                    else:
+                        candidate_sl = max(current_price + 0.8 * risk_distance,
+                                           entry_price + 0.05 * risk_distance)
+                        if candidate_sl < current_sl and candidate_sl > current_price and candidate_sl > entry_price:
+                            self._modify_stop_loss(ticket, candidate_sl)
 
             # 计算盈利百分比
             profit_pct = price_diff_usd / entry_price if entry_price > 0 else 0
