@@ -39,6 +39,22 @@ from sklearn.cluster import KMeans
 
 from sklearn.decomposition import PCA
 
+from sklearn.calibration import CalibratedClassifierCV
+
+# LightGBM/XGBoost导入（可选，优先使用LightGBM）
+try:
+    import lightgbm as lgb  # type: ignore
+
+    LIGHTGBM_AVAILABLE = True
+except ImportError:
+    LIGHTGBM_AVAILABLE = False
+    try:
+        import xgboost as xgb  # type: ignore
+
+        XGBOOST_AVAILABLE = True
+    except ImportError:
+        XGBOOST_AVAILABLE = False
+
 import pickle
 
 import os
@@ -64,6 +80,21 @@ except ImportError:
     # logger将在后面定义，这里先不输出警告
 
 from collections import defaultdict
+
+# 回测相关导入
+try:
+    from scipy import stats
+    from scipy.stats import ttest_1samp, mannwhitneyu
+
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    # logger将在后面定义，这里先不输出警告
+
+import itertools
+import warnings
+
+warnings.filterwarnings('ignore')
 
 # 配置专业日志系统
 
@@ -1556,6 +1587,20 @@ class ProfessionalTickDataEngine:
             current_price = prices[-1]
 
             indicators['CURRENT_PRICE'] = current_price
+            # 点差（如果有最新tick）
+            try:
+                if self.tick_buffer:
+                    last_tick = self.tick_buffer[-1]
+                    bid_val = last_tick.get('bid', 0.0)
+                    ask_val = last_tick.get('ask', 0.0)
+                    if bid_val and ask_val:
+                        indicators['SPREAD'] = abs(ask_val - bid_val)
+                    else:
+                        indicators['SPREAD'] = 0.0
+                else:
+                    indicators['SPREAD'] = 0.0
+            except Exception:
+                indicators['SPREAD'] = 0.0
 
             # 1. 多周期RSI
 
@@ -2376,30 +2421,40 @@ class ProfessionalTickDataEngine:
                 bearish_signals += 1
 
             if bullish_signals >= 3:
-
+                confidence = min(1.0, bullish_signals / 5.0)
+                logger.debug(f"🔍 [趋势启动检测] 看涨信号: 信号数={bullish_signals}/5, "
+                             f"置信度={confidence:.2f}, 价格={current_price:.2f}, "
+                             f"EMA5={ema5:.2f}, 价格在EMA5{'上方' if price_above_ema5 else '下方'}")
                 return {
 
                     'trend_start': True,
 
                     'direction': 'BULLISH',
 
-                    'confidence': min(1.0, bullish_signals / 5.0),
+                    'confidence': confidence,
 
-                    'stage': 'EARLY'  # 早期阶段
+                    'stage': 'EARLY',  # 早期阶段
+
+                    'signal_count': bullish_signals  # 添加信号数量用于调试
 
                 }
 
             elif bearish_signals >= 3:
-
+                confidence = min(1.0, bearish_signals / 5.0)
+                logger.debug(f"🔍 [趋势启动检测] 看跌信号: 信号数={bearish_signals}/5, "
+                             f"置信度={confidence:.2f}, 价格={current_price:.2f}, "
+                             f"EMA5={ema5:.2f}, 价格在EMA5{'下方' if price_below_ema5 else '上方'}")
                 return {
 
                     'trend_start': True,
 
                     'direction': 'BEARISH',
 
-                    'confidence': min(1.0, bearish_signals / 5.0),
+                    'confidence': confidence,
 
-                    'stage': 'EARLY'
+                    'stage': 'EARLY',
+
+                    'signal_count': bearish_signals  # 添加信号数量用于调试
 
                 }
 
@@ -4280,21 +4335,50 @@ class MLSignalEvaluator:
 
         self.is_trained = False
 
-        # 特征列表（用于模型训练和预测）
-
-        self.feature_names = [
-
+        # 特征列表（用于模型训练和预测）- 增强版
+        # 基础特征（16个）
+        base_features = [
             'signal_strength', 'fusion_confidence', 'consistency',
-
             'adx', 'ema_alignment', 'macd_trend', 'rsi_14',
-
             'stoch_k', 'stoch_d', 'atr_percent', 'bb_position',
-
             'price_momentum', 'volume_ratio', 'market_state_confidence',
-
             'trend_start', 'reversal_signal'
-
         ]
+
+        # 序列统计特征（10个）
+        sequence_features = [
+            'price_return_mean_5', 'price_return_mean_10', 'price_return_std_5',
+            'price_return_std_10', 'max_drawdown_10', 'max_gain_10',
+            'volume_change_rate', 'volatility_percentile', 'momentum_acceleration',
+            'price_skewness_10'
+        ]
+
+        # 结构特征（8个）
+        structure_features = [
+            'resistance_distance_pct', 'support_distance_pct', 'bb_upper_distance_pct',
+            'bb_lower_distance_pct', 'vwap_distance_pct', 'recent_high_distance_pct',
+            'recent_low_distance_pct', 'key_level_proximity'
+        ]
+
+        # 多周期特征（6个）
+        multi_timeframe_features = [
+            'higher_tf_trend', 'higher_tf_momentum', 'higher_tf_adx',
+            'higher_tf_rsi', 'higher_tf_ema_alignment', 'higher_tf_volatility'
+        ]
+
+        # 形态和背离特征（6个）
+        pattern_features = [
+            'candle_pattern_score', 'macd_divergence', 'rsi_divergence',
+            'volume_divergence', 'breakout_confirmation', 'fake_breakout_flag'
+        ]
+
+        # 成本特征（3个）
+        cost_features = [
+            'spread_cost_pct', 'commission_cost_pct', 'slippage_estimate_pct'
+        ]
+
+        self.feature_names = base_features + sequence_features + structure_features + \
+                             multi_timeframe_features + pattern_features + cost_features
 
         # 历史信号数据（用于训练）
 
@@ -4319,6 +4403,14 @@ class MLSignalEvaluator:
             'last_training_time': None
 
         }
+
+        # 在线学习与漂移监控
+        self.last_retrain_time = None
+        self.retrain_interval = 86400  # 24小时重训练一次
+        self.min_new_samples_for_retrain = 50  # 至少50个新样本才重训练
+        self.feature_distribution_history = deque(maxlen=1000)  # 保存最近1000个特征分布
+        self.real_trading_results = deque(maxlen=500)  # 保存实盘交易结果
+        self.drift_detection_threshold = 0.3  # 特征分布漂移阈值
 
         # 尝试加载已训练的模型
 
@@ -4390,7 +4482,7 @@ class MLSignalEvaluator:
 
     def extract_features(self, signal: Dict, indicators: Dict, market_state: str, state_confidence: float,
                          data_engine=None) -> np.ndarray:
-        """从信号和指标中提取特征向量"""
+        """从信号和指标中提取增强特征向量（包含序列、结构、多周期、形态、成本特征）"""
 
         try:
 
@@ -4398,65 +4490,316 @@ class MLSignalEvaluator:
                 self.data_engine = data_engine
 
             features = []
+            prices = list(self.data_engine.price_buffer) if hasattr(self,
+                                                                    'data_engine') and self.data_engine and hasattr(
+                self.data_engine, 'price_buffer') else []
+            highs = list(self.data_engine.high_buffer) if hasattr(self, 'data_engine') and self.data_engine and hasattr(
+                self.data_engine, 'high_buffer') else []
+            lows = list(self.data_engine.low_buffer) if hasattr(self, 'data_engine') and self.data_engine and hasattr(
+                self.data_engine, 'low_buffer') else []
+            volumes = list(self.data_engine.volume_buffer) if hasattr(self,
+                                                                      'data_engine') and self.data_engine and hasattr(
+                self.data_engine, 'volume_buffer') else []
 
-            # 信号特征
+            current_price = indicators.get('CURRENT_PRICE', prices[-1] if prices else 0.0)
+            if current_price == 0 and prices:
+                current_price = prices[-1]
 
+            # ========== 1. 基础特征（16个） ==========
             features.append(signal.get('strength', 0.0))
-
             features.append(signal.get('fusion_confidence', 0.0))
-
             features.append(signal.get('consistency', 0.0))
-
-            # 技术指标特征
-
             features.append(indicators.get('ADX', 0.0))
-
             features.append(indicators.get('EMA_ALIGNMENT', 0.0))
-
             features.append(indicators.get('MACD_TREND', 0.0))
-
             features.append(indicators.get('RSI_14', 50.0))
-
             features.append(indicators.get('STOCH_K', 50.0))
-
             features.append(indicators.get('STOCH_D', 50.0))
-
             features.append(indicators.get('ATR_PERCENT', 0.0))
-
             features.append(indicators.get('BB_POSITION', 0.0))
 
             # 价格动量
-
-            prices = list(self.data_engine.price_buffer) if hasattr(self, 'data_engine') and self.data_engine else []
-
             if len(prices) >= 5:
-
                 price_momentum = (prices[-1] - prices[-5]) / prices[-5] if prices[-5] > 0 else 0.0
-
             else:
-
                 price_momentum = 0.0
-
             features.append(price_momentum)
 
-            # 成交量比率（如果有）
-
             features.append(indicators.get('VOLUME_RATIO', 1.0))
-
-            # 市场状态特征
-
             features.append(state_confidence)
-
             features.append(1.0 if signal.get('trend_start', False) else 0.0)
-
             features.append(1.0 if signal.get('reversal_signal', False) else 0.0)
+
+            # ========== 2. 序列统计特征（10个） ==========
+            if len(prices) >= 10:
+                # 价格收益率统计
+                returns_5 = [(prices[i] - prices[i - 1]) / prices[i - 1] if prices[i - 1] > 0 else 0
+                             for i in range(max(1, len(prices) - 5), len(prices))]
+                returns_10 = [(prices[i] - prices[i - 1]) / prices[i - 1] if prices[i - 1] > 0 else 0
+                              for i in range(max(1, len(prices) - 10), len(prices))]
+
+                features.append(np.mean(returns_5) if returns_5 else 0.0)  # price_return_mean_5
+                features.append(np.mean(returns_10) if returns_10 else 0.0)  # price_return_mean_10
+                features.append(np.std(returns_5) if len(returns_5) > 1 else 0.0)  # price_return_std_5
+                features.append(np.std(returns_10) if len(returns_10) > 1 else 0.0)  # price_return_std_10
+
+                # 最大回撤和最大涨幅
+                recent_10 = prices[-10:]
+                peak = max(recent_10)
+                trough = min(recent_10)
+                max_drawdown = (peak - trough) / peak if peak > 0 else 0.0
+                max_gain = (peak - recent_10[0]) / recent_10[0] if recent_10[0] > 0 else 0.0
+                features.append(max_drawdown)  # max_drawdown_10
+                features.append(max_gain)  # max_gain_10
+
+                # 成交量变化率
+                if len(volumes) >= 10:
+                    vol_change = (volumes[-1] - np.mean(volumes[-10:-5])) / np.mean(volumes[-10:-5]) if np.mean(
+                        volumes[-10:-5]) > 0 else 0.0
+                else:
+                    vol_change = 0.0
+                features.append(vol_change)  # volume_change_rate
+
+                # 波动率分位数（相对于历史波动率）
+                atr_percent = indicators.get('ATR_PERCENT', 0.0)
+                if len(prices) >= 50:
+                    historical_vol = np.std([(prices[i] - prices[i - 1]) / prices[i - 1] if prices[i - 1] > 0 else 0
+                                             for i in range(max(1, len(prices) - 50), len(prices))])
+                    vol_percentile = min(1.0, atr_percent / (historical_vol * 100) if historical_vol > 0 else 0.5)
+                else:
+                    vol_percentile = 0.5
+                features.append(vol_percentile)  # volatility_percentile
+
+                # 动量加速度
+                if len(prices) >= 10:
+                    momentum_5 = (prices[-1] - prices[-5]) / prices[-5] if prices[-5] > 0 else 0.0
+                    momentum_10 = (prices[-5] - prices[-10]) / prices[-10] if prices[-10] > 0 else 0.0
+                    momentum_accel = momentum_5 - momentum_10
+                else:
+                    momentum_accel = 0.0
+                features.append(momentum_accel)  # momentum_acceleration
+
+                # 价格偏度
+                if len(returns_10) >= 3:
+                    price_skew = (np.mean([(r - np.mean(returns_10)) ** 3 for r in returns_10]) /
+                                  (np.std(returns_10) ** 3 + 1e-8)) if np.std(returns_10) > 0 else 0.0
+                else:
+                    price_skew = 0.0
+                features.append(price_skew)  # price_skewness_10
+            else:
+                # 数据不足时填充0
+                features.extend([0.0] * 10)
+
+            # ========== 3. 结构特征（8个） ==========
+            if len(prices) >= 20 and current_price > 0:
+                # 支撑阻力距离
+                recent_highs = highs[-20:] if len(highs) >= 20 else prices[-20:]
+                recent_lows = lows[-20:] if len(lows) >= 20 else prices[-20:]
+                resistance = max(recent_highs[:-5]) if len(recent_highs) > 5 else max(
+                    recent_highs) if recent_highs else current_price
+                support = min(recent_lows[:-5]) if len(recent_lows) > 5 else min(
+                    recent_lows) if recent_lows else current_price
+
+                features.append((
+                                            resistance - current_price) / current_price if current_price > 0 else 0.0)  # resistance_distance_pct
+                features.append(
+                    (current_price - support) / current_price if current_price > 0 else 0.0)  # support_distance_pct
+
+                # 布林带距离
+                bb_upper = indicators.get('BB_UPPER_2.0', current_price * 1.02)
+                bb_lower = indicators.get('BB_LOWER_2.0', current_price * 0.98)
+                features.append(
+                    (bb_upper - current_price) / current_price if current_price > 0 else 0.0)  # bb_upper_distance_pct
+                features.append(
+                    (current_price - bb_lower) / current_price if current_price > 0 else 0.0)  # bb_lower_distance_pct
+
+                # VWAP距离
+                vwap = indicators.get('VWAP', current_price)
+                features.append((current_price - vwap) / vwap if vwap > 0 else 0.0)  # vwap_distance_pct
+
+                # 近期高低点距离
+                recent_high = max(prices[-10:]) if len(prices) >= 10 else current_price
+                recent_low = min(prices[-10:]) if len(prices) >= 10 else current_price
+                features.append((
+                                            recent_high - current_price) / current_price if current_price > 0 else 0.0)  # recent_high_distance_pct
+                features.append((
+                                            current_price - recent_low) / current_price if current_price > 0 else 0.0)  # recent_low_distance_pct
+
+                # 关键价位接近度（综合）
+                key_levels = [resistance, support, bb_upper, bb_lower, recent_high, recent_low]
+                min_distance = min([abs(current_price - level) / current_price for level in key_levels if level > 0])
+                key_proximity = 1.0 / (1.0 + min_distance * 100)  # 归一化到0-1
+                features.append(key_proximity)  # key_level_proximity
+            else:
+                features.extend([0.0] * 8)
+
+            # ========== 4. 多周期特征（6个） ==========
+            try:
+                # 获取更高时间框架数据（M15）
+                higher_tf_data = self.data_engine._get_candle_data(mt5.TIMEFRAME_M15, 50) if hasattr(self.data_engine,
+                                                                                                     '_get_candle_data') else None
+                if higher_tf_data is not None and len(higher_tf_data) >= 20:
+                    higher_closes = higher_tf_data['close']
+                    higher_highs = higher_tf_data['high']
+                    higher_lows = higher_tf_data['low']
+
+                    # 计算更高时间框架的指标
+                    higher_adx = talib.ADX(higher_highs, higher_lows, higher_closes, timeperiod=14)
+                    higher_rsi = talib.RSI(higher_closes, timeperiod=14)
+                    higher_ema_5 = talib.EMA(higher_closes, timeperiod=5)
+                    higher_ema_15 = talib.EMA(higher_closes, timeperiod=15)
+
+                    # 趋势方向（1=上涨，-1=下跌，0=震荡）
+                    higher_trend = 1.0 if higher_closes[-1] > higher_ema_15[-1] else (
+                        -1.0 if higher_closes[-1] < higher_ema_15[-1] else 0.0)
+                    higher_momentum = (higher_closes[-1] - higher_closes[-5]) / higher_closes[-5] if len(
+                        higher_closes) >= 5 and higher_closes[-5] > 0 else 0.0
+                    higher_adx_val = higher_adx[-1] if len(higher_adx) > 0 and not np.isnan(higher_adx[-1]) else 0.0
+                    higher_rsi_val = higher_rsi[-1] if len(higher_rsi) > 0 and not np.isnan(higher_rsi[-1]) else 50.0
+                    higher_ema_align = (higher_ema_5[-1] - higher_ema_15[-1]) / higher_ema_15[-1] if higher_ema_15[
+                                                                                                         -1] > 0 else 0.0
+                    higher_volatility = np.std(higher_closes[-20:]) / np.mean(higher_closes[-20:]) if np.mean(
+                        higher_closes[-20:]) > 0 else 0.0
+
+                    features.append(higher_trend)  # higher_tf_trend
+                    features.append(higher_momentum)  # higher_tf_momentum
+                    features.append(higher_adx_val / 100.0)  # higher_tf_adx (归一化)
+                    features.append(higher_rsi_val / 100.0)  # higher_tf_rsi (归一化)
+                    features.append(higher_ema_align)  # higher_tf_ema_alignment
+                    features.append(higher_volatility)  # higher_tf_volatility
+                else:
+                    features.extend([0.0] * 6)
+            except Exception as e:
+                logger.debug(f"多周期特征计算异常: {str(e)}")
+                features.extend([0.0] * 6)
+
+            # ========== 5. 形态和背离特征（6个） ==========
+            try:
+                # K线形态评分（简化版）
+                candle_score = 0.0
+                if len(prices) >= 3 and len(highs) >= 3 and len(lows) >= 3:
+                    # 检查是否出现看涨/看跌K线形态
+                    current_close = prices[-1]
+                    prev_close = prices[-2]
+                    current_high = highs[-1] if len(highs) > 0 else current_close
+                    current_low = lows[-1] if len(lows) > 0 else current_close
+                    prev_high = highs[-2] if len(highs) > 1 else prev_close
+                    prev_low = lows[-2] if len(lows) > 1 else prev_close
+
+                    # 锤子线/上吊线
+                    body = abs(current_close - prices[-1])
+                    upper_shadow = current_high - max(current_close, prices[-1])
+                    lower_shadow = min(current_close, prices[-1]) - current_low
+                    if lower_shadow > body * 2 and upper_shadow < body * 0.5:
+                        candle_score += 0.3 if signal.get('direction') == 'BUY' else -0.3
+
+                    # 吞没形态
+                    if (current_close > prev_high and prices[-1] < prev_low) or \
+                            (current_close < prev_low and prices[-1] > prev_high):
+                        candle_score += 0.4 if signal.get('direction') == 'BUY' else -0.4
+
+                features.append(candle_score)  # candle_pattern_score
+
+                # MACD背离（简化检测）
+                macd_hist = indicators.get('MACD_HIST', 0.0)
+                macd_trend = indicators.get('MACD_TREND', 0.0)
+                macd_divergence = 0.0
+                if len(prices) >= 20:
+                    # 价格创新高但MACD未创新高（看跌背离）
+                    if prices[-1] > max(prices[-10:-5]) and macd_hist < 0:
+                        macd_divergence = -0.5
+                    # 价格创新低但MACD未创新低（看涨背离）
+                    elif prices[-1] < min(prices[-10:-5]) and macd_hist > 0:
+                        macd_divergence = 0.5
+                features.append(macd_divergence)  # macd_divergence
+
+                # RSI背离（简化检测）
+                rsi_14 = indicators.get('RSI_14', 50.0)
+                rsi_divergence = 0.0
+                if len(prices) >= 20:
+                    if prices[-1] > max(prices[-10:-5]) and rsi_14 < 70:
+                        rsi_divergence = -0.5
+                    elif prices[-1] < min(prices[-10:-5]) and rsi_14 > 30:
+                        rsi_divergence = 0.5
+                features.append(rsi_divergence)  # rsi_divergence
+
+                # 成交量背离
+                volume_divergence = 0.0
+                if len(volumes) >= 10 and len(prices) >= 10:
+                    price_trend = (prices[-1] - prices[-5]) / prices[-5] if prices[-5] > 0 else 0.0
+                    volume_trend = (np.mean(volumes[-5:]) - np.mean(volumes[-10:-5])) / np.mean(
+                        volumes[-10:-5]) if np.mean(volumes[-10:-5]) > 0 else 0.0
+                    if price_trend > 0 and volume_trend < 0:
+                        volume_divergence = -0.3  # 价涨量缩
+                    elif price_trend < 0 and volume_trend > 0:
+                        volume_divergence = 0.3  # 价跌量增
+                features.append(volume_divergence)  # volume_divergence
+
+                # 突破确认
+                breakout_confirmation = 0.0
+                if len(prices) >= 20:
+                    resistance = max(prices[-20:-5]) if len(prices) >= 20 else current_price
+                    support = min(prices[-20:-5]) if len(prices) >= 20 else current_price
+                    if current_price > resistance * 1.001:
+                        breakout_confirmation = 0.5
+                    elif current_price < support * 0.999:
+                        breakout_confirmation = -0.5
+                features.append(breakout_confirmation)  # breakout_confirmation
+
+                # 假突破标记
+                fake_breakout = 0.0
+                if len(prices) >= 30:
+                    # 检查是否突破后快速回撤
+                    recent_max = max(prices[-10:])
+                    recent_min = min(prices[-10:])
+                    if current_price < recent_max * 0.998 and prices[-5] > recent_max * 1.001:
+                        fake_breakout = -0.5  # 假向上突破
+                    elif current_price > recent_min * 1.002 and prices[-5] < recent_min * 0.999:
+                        fake_breakout = 0.5  # 假向下突破
+                features.append(fake_breakout)  # fake_breakout_flag
+            except Exception as e:
+                logger.debug(f"形态特征计算异常: {str(e)}")
+                features.extend([0.0] * 6)
+
+            # ========== 6. 成本特征（3个） ==========
+            try:
+                # 点差成本（百分比）
+                symbol_info = self.data_engine.data_validator.symbol_info if hasattr(self.data_engine,
+                                                                                     'data_validator') else None
+                if symbol_info:
+                    spread = abs(symbol_info.ask - symbol_info.bid) if hasattr(symbol_info, 'ask') else 0.0
+                    spread_cost_pct = spread / current_price if current_price > 0 else 0.0
+                else:
+                    spread_cost_pct = indicators.get('SPREAD', 0.0) / current_price if current_price > 0 else 0.0
+                features.append(spread_cost_pct)  # spread_cost_pct
+
+                # 手续费成本（百分比，假设1手）
+                commission_per_lot = ProfessionalComplexConfig.COMMISSION_PER_LOT
+                lot_size = 1.0
+                commission_usd = commission_per_lot * lot_size
+                # 转换为价格百分比（假设每手100盎司）
+                commission_cost_pct = (commission_usd / 100.0) / current_price if current_price > 0 else 0.0
+                features.append(commission_cost_pct)  # commission_cost_pct
+
+                # 滑点估计（百分比，保守估计为点差的50%）
+                slippage_estimate_pct = spread_cost_pct * 0.5
+                features.append(slippage_estimate_pct)  # slippage_estimate_pct
+            except Exception as e:
+                logger.debug(f"成本特征计算异常: {str(e)}")
+                features.extend([0.0] * 3)
+
+            # 确保特征数量匹配
+            if len(features) < len(self.feature_names):
+                features.extend([0.0] * (len(self.feature_names) - len(features)))
+            elif len(features) > len(self.feature_names):
+                features = features[:len(self.feature_names)]
 
             return np.array(features, dtype=np.float32)
 
         except Exception as e:
 
             logger.warning(f"提取特征异常: {str(e)}")
-
+            traceback.print_exc()
             return np.zeros(len(self.feature_names), dtype=np.float32)
 
     def evaluate_signal(self, signal: Dict, indicators: Dict, market_state: str,
@@ -4535,123 +4878,123 @@ class MLSignalEvaluator:
             # ML预测（如果模型已训练）
 
             ml_prediction = None
-
             ml_confidence = 0.0
+            ml_success_prob = None
 
             if self.is_trained and self.model is not None:
-
                 try:
-
                     # 标准化特征
-
                     features_scaled = self.scaler.transform(features.reshape(1, -1))
-
-                    # 预测
-
+                    # 预测类别
                     ml_prediction = self.model.predict(features_scaled)[0]
-
-                    # 获取预测概率
-
+                    # 获取预测概率；使用正类概率作为成功率
                     if hasattr(self.model, 'predict_proba'):
-
                         proba = self.model.predict_proba(features_scaled)[0]
-
-                        ml_confidence = max(proba)  # 最高类别概率
-
+                        # 假定正类为标签1
+                        if len(proba) > 1:
+                            ml_success_prob = float(proba[1])  # 正类（成功）的概率
+                        else:
+                            ml_success_prob = float(proba[0])
+                        ml_confidence = max(proba)
+                        logger.debug(
+                            f"🔍 [ML预测] 模型已训练，预测概率: {proba}, 成功概率={ml_success_prob:.4f}, 置信度={ml_confidence:.4f}")
                     else:
-
                         ml_confidence = 0.7  # 默认置信度
-
+                        ml_success_prob = float(ml_prediction) if ml_prediction is not None else 0.0
+                        logger.debug(
+                            f"🔍 [ML预测] 模型无predict_proba方法，使用预测值: {ml_prediction}, 成功概率={ml_success_prob:.4f}")
                 except Exception as e:
-
                     logger.warning(f"ML预测异常: {str(e)}")
+                    import traceback
+                    logger.debug(traceback.format_exc())
+            else:
+                logger.debug(f"🔍 [ML预测] 模型未训练: is_trained={self.is_trained}, model={self.model is not None}")
+
+            # ========== 分层阈值策略 ==========
+            signal_type = signal.get('signal_type', 'UNKNOWN')
+            is_reversal = signal.get('reversal_signal', False)
+            is_trend_start = signal.get('trend_start', False)
+
+            # 根据信号类型调整阈值和权重
+            if is_reversal:
+                # 反转信号：需要更高的成功率和质量评分
+                ml_weight = 0.5  # 更依赖ML评估
+                base_weight = 0.5
+                min_success_threshold = 0.55  # 反转信号最低成功率55%
+                min_quality_threshold = 0.70  # 反转信号最低质量评分70%
+            elif is_trend_start or signal_type in ['EARLY_TREND', 'OPTIMIZED_TREND']:
+                # 趋势启动信号：可以放宽成功率要求，但强调质量评分
+                ml_weight = 0.35
+                base_weight = 0.65
+                min_success_threshold = 0.40  # 趋势启动最低成功率40%
+                min_quality_threshold = 0.60  # 趋势启动最低质量评分60%
+            else:
+                # 普通信号：平衡要求
+                ml_weight = 0.4
+                base_weight = 0.6
+                min_success_threshold = 0.45  # 普通信号最低成功率45%
+                min_quality_threshold = 0.65  # 普通信号最低质量评分65%
 
             # 综合评估
-
-            if ml_prediction is not None:
-
-                # 使用ML预测调整质量评分
-
-                ml_weight = 0.4
-
-                base_weight = 0.6
-
-                quality_score = base_score * base_weight + ml_prediction * ml_weight * ml_confidence
-
-                success_probability = ml_prediction * ml_confidence
-
+            if ml_prediction is not None and ml_success_prob is not None:
+                # 使用正类概率调整质量评分与成功率
+                success_probability = ml_success_prob
+                quality_score = base_score * base_weight + ml_success_prob * ml_weight
+            elif ml_prediction is not None:
+                success_probability = float(ml_prediction) * ml_confidence
+                quality_score = base_score * base_weight + float(ml_prediction) * ml_weight * ml_confidence
             else:
+                # ML模型未训练或预测失败：不使用兜底估计，直接设置为0
+                # 避免错误地提高信号成功率，让信号过滤机制正常工作
+                success_probability = 0.0
+                quality_score = base_score * base_weight  # 仅使用基础评估，不添加ML权重
+                logger.debug(
+                    f"🔍 [ML评估] 模型未训练或预测失败，成功率设置为0.0，质量评分={quality_score:.4f}（仅基础评分）")
 
-                # 仅使用基础评估 - 优化成功率估算
+            # ========== 阈值检查（分层策略） ==========
+            passes_threshold = True
+            threshold_reason = ""
 
-                # 根据信号强度和市场状态调整成功率估算
+            if success_probability < min_success_threshold:
+                passes_threshold = False
+                threshold_reason = f"成功率不足: {success_probability:.2%} < {min_success_threshold:.2%}"
+            elif quality_score < min_quality_threshold:
+                passes_threshold = False
+                threshold_reason = f"质量评分不足: {quality_score:.2f} < {min_quality_threshold:.2f}"
 
-                if market_state == 'TRENDING':
-
-                    success_probability = quality_score * 0.85  # 趋势市：成功率估算更高
-
-                elif market_state == 'RANGING':
-
-                    success_probability = quality_score * 0.75  # 震荡市：成功率估算中等
-
-                else:
-
-                    success_probability = quality_score * 0.80  # 其他：标准估算
-
-                # 如果信号强度很高，进一步提高成功率估算
-
-                if base_score >= 0.6:
-
-                    success_probability = min(1.0, success_probability * 1.15)
-
-                elif base_score >= 0.5:
-
-                    success_probability = min(1.0, success_probability * 1.10)
-
-            # 生成推荐
-
-            if quality_score >= 0.75:
-
+            # 生成推荐（考虑阈值检查结果）
+            if not passes_threshold:
+                recommendation = 'NEUTRAL'  # 未通过阈值，标记为中性
+            elif quality_score >= 0.75:
                 recommendation = 'STRONG_BUY' if signal.get('direction') == 'BUY' else 'STRONG_SELL'
-
             elif quality_score >= 0.6:
-
                 recommendation = 'BUY' if signal.get('direction') == 'BUY' else 'SELL'
-
             elif quality_score >= 0.4:
-
                 recommendation = 'NEUTRAL'
-
             else:
-
                 recommendation = 'SELL' if signal.get('direction') == 'BUY' else 'BUY'
 
             # 特征字典
-
-            feature_dict = {name: float(features[i]) for i, name in enumerate(self.feature_names)}
+            feature_dict = {name: float(features[i]) for i, name in enumerate(self.feature_names) if i < len(features)}
 
             # 详细评估信息
-
             evaluation_details = {
-
                 'base_score': base_score,
-
                 'fusion_confidence': fusion_confidence,
-
                 'consistency': consistency,
-
                 'ml_prediction': float(ml_prediction) if ml_prediction is not None else None,
-
                 'ml_confidence': ml_confidence,
-
                 'adx': indicators.get('ADX', 0),
-
                 'ema_alignment': indicators.get('EMA_ALIGNMENT', 0),
-
+                'signal_type': signal_type,
+                'is_reversal': is_reversal,
+                'is_trend_start': is_trend_start,
+                'min_success_threshold': min_success_threshold,
+                'min_quality_threshold': min_quality_threshold,
+                'passes_threshold': passes_threshold,
+                'threshold_reason': threshold_reason,
                 'market_state': market_state,
-
                 'state_confidence': state_confidence
-
             }
 
             return {
@@ -4740,8 +5083,20 @@ class MLSignalEvaluator:
 
             y = np.array(self.training_labels)
 
-            # 数据分割
+            # 简单过采样少数类，缓解类别不平衡
+            class_counts = np.bincount(y)
+            if len(class_counts) > 1 and class_counts[1] > 0 and class_counts[1] < class_counts[0]:
+                majority = class_counts[0]
+                minority = class_counts[1]
+                pos_idx = np.where(y == 1)[0]
+                extra = min(majority - minority, minority * 3)  # 最多再扩充3倍
+                if extra > 0 and len(pos_idx) > 0:
+                    extra_idx = np.random.choice(pos_idx, size=extra, replace=True)
+                    X = np.concatenate([X, X[extra_idx]], axis=0)
+                    y = np.concatenate([y, y[extra_idx]], axis=0)
+                    logger.info(f"📊 少数类过采样: 原始正样本={minority}, 扩充={extra}, 新样本总数={len(y)}")
 
+            # 数据分割
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
             # 标准化
@@ -4750,21 +5105,65 @@ class MLSignalEvaluator:
 
             X_test_scaled = self.scaler.transform(X_test)
 
-            # 训练模型（使用梯度提升，通常比随机森林更适合小样本）
-
-            self.model = GradientBoostingClassifier(
-
-                n_estimators=100,
-
-                learning_rate=0.1,
-
-                max_depth=5,
-
-                random_state=42
-
-            )
+            # 训练模型（优先使用LightGBM/XGBoost，支持类别权重和更好的性能）
+            if LIGHTGBM_AVAILABLE:
+                # 使用LightGBM（最佳选择）
+                self.model = lgb.LGBMClassifier(
+                    n_estimators=300,
+                    max_depth=7,
+                    learning_rate=0.05,
+                    num_leaves=31,
+                    min_child_samples=20,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    class_weight='balanced',
+                    reg_alpha=0.1,
+                    reg_lambda=0.1,
+                    n_jobs=-1,
+                    random_state=42,
+                    verbose=-1
+                )
+                logger.info("🤖 使用LightGBM训练模型")
+            elif XGBOOST_AVAILABLE:
+                # 使用XGBoost（备选）
+                self.model = xgb.XGBClassifier(
+                    n_estimators=300,
+                    max_depth=7,
+                    learning_rate=0.05,
+                    min_child_weight=3,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    scale_pos_weight=len(y_train[y_train == 0]) / len(y_train[y_train == 1]) if len(
+                        y_train[y_train == 1]) > 0 else 1.0,
+                    reg_alpha=0.1,
+                    reg_lambda=0.1,
+                    n_jobs=-1,
+                    random_state=42,
+                    eval_metric='logloss'
+                )
+                logger.info("🤖 使用XGBoost训练模型")
+            else:
+                # 回退到随机森林
+                self.model = RandomForestClassifier(
+                    n_estimators=200,
+                    max_depth=None,
+                    min_samples_leaf=2,
+                    class_weight='balanced_subsample',
+                    n_jobs=-1,
+                    random_state=42
+                )
+                logger.info("🤖 使用RandomForest训练模型（LightGBM/XGBoost不可用）")
 
             self.model.fit(X_train_scaled, y_train)
+
+            # 概率校准（提高成功率预测的准确性）
+            try:
+                if hasattr(self.model, 'predict_proba'):
+                    self.model = CalibratedClassifierCV(self.model, method='isotonic', cv=3)
+                    self.model.fit(X_train_scaled, y_train)
+                    logger.info("✅ 模型概率校准完成（Isotonic校准）")
+            except Exception as cal_error:
+                logger.warning(f"⚠️ 概率校准失败: {str(cal_error)}，使用原始模型")
 
             # 评估模型
 
@@ -4849,6 +5248,615 @@ class MLSignalEvaluator:
             'model_path': self.model_path
 
         }
+
+    def record_real_trading_result(self, signal_features: np.ndarray, signal: Dict,
+                                   final_profit: float, is_success: bool):
+        """
+        记录实盘交易结果，用于在线学习
+
+        Args:
+            signal_features: 信号特征向量
+            signal: 信号字典
+            final_profit: 最终盈亏（USD）
+            is_success: 是否成功（盈利>0）
+        """
+        try:
+            self.real_trading_results.append({
+                'features': signal_features.copy(),
+                'signal': signal.copy(),
+                'final_profit': final_profit,
+                'is_success': is_success,
+                'timestamp': time.time()
+            })
+
+            # 保存特征分布（用于漂移检测）
+            self.feature_distribution_history.append(signal_features.copy())
+
+            # 如果积累足够的新样本，触发增量训练检查
+            if len(self.real_trading_results) >= self.min_new_samples_for_retrain:
+                self._check_and_retrain()
+        except Exception as e:
+            logger.warning(f"记录实盘交易结果异常: {str(e)}")
+
+    def _check_and_retrain(self):
+        """检查是否需要重训练（基于时间间隔和样本数量）"""
+        try:
+            current_time = time.time()
+
+            # 检查时间间隔
+            if self.last_retrain_time is not None:
+                time_since_retrain = current_time - self.last_retrain_time
+                if time_since_retrain < self.retrain_interval:
+                    return  # 未到重训练时间
+
+            # 检查是否有足够的新样本
+            if len(self.real_trading_results) < self.min_new_samples_for_retrain:
+                return
+
+            # 检查特征分布漂移
+            drift_detected = self._detect_feature_drift()
+
+            if drift_detected or time_since_retrain >= self.retrain_interval:
+                logger.info(
+                    f"🔄 触发模型重训练: 漂移检测={drift_detected}, 时间间隔={time_since_retrain / 3600:.1f}小时")
+                self._incremental_retrain()
+                self.last_retrain_time = current_time
+        except Exception as e:
+            logger.warning(f"检查重训练异常: {str(e)}")
+
+    def _detect_feature_drift(self) -> bool:
+        """
+        检测特征分布漂移
+
+        Returns:
+            bool: 是否检测到漂移
+        """
+        try:
+            if len(self.feature_distribution_history) < 100:
+                return False  # 样本不足，无法检测
+
+            # 将历史特征分为两段：旧样本和新样本
+            split_point = len(self.feature_distribution_history) // 2
+            old_features = np.array(list(self.feature_distribution_history)[:split_point])
+            new_features = np.array(list(self.feature_distribution_history)[split_point:])
+
+            # 计算均值和标准差
+            old_mean = np.mean(old_features, axis=0)
+            new_mean = np.mean(new_features, axis=0)
+            old_std = np.std(old_features, axis=0) + 1e-8  # 避免除零
+
+            # 计算标准化差异（Z-score）
+            z_scores = np.abs((new_mean - old_mean) / old_std)
+
+            # 如果超过阈值的特征比例超过30%，认为发生漂移
+            drift_ratio = np.sum(z_scores > self.drift_detection_threshold) / len(z_scores)
+
+            if drift_ratio > 0.3:
+                logger.info(f"⚠️ 检测到特征分布漂移: {drift_ratio:.2%}的特征发生显著变化")
+                return True
+
+            return False
+        except Exception as e:
+            logger.warning(f"特征漂移检测异常: {str(e)}")
+            return False
+
+    def _incremental_retrain(self):
+        """
+        增量重训练：使用历史数据+新实盘数据
+        """
+        try:
+            if len(self.real_trading_results) < self.min_new_samples_for_retrain:
+                logger.warning(f"⚠️ 实盘样本不足({len(self.real_trading_results)})，跳过增量训练")
+                return
+
+            # 从实盘结果中提取特征和标签
+            new_features = []
+            new_labels = []
+
+            for result in self.real_trading_results:
+                new_features.append(result['features'])
+                new_labels.append(1 if result['is_success'] else 0)
+
+            # 合并历史训练数据和新数据
+            if len(self.training_data) > 0:
+                all_features = np.concatenate([np.array(self.training_data), np.array(new_features)])
+                all_labels = np.concatenate([np.array(self.training_labels), np.array(new_labels)])
+            else:
+                all_features = np.array(new_features)
+                all_labels = np.array(new_labels)
+
+            # 限制总样本数（保留最近的数据）
+            max_total_samples = 5000
+            if len(all_features) > max_total_samples:
+                all_features = all_features[-max_total_samples:]
+                all_labels = all_labels[-max_total_samples:]
+
+            # 更新训练数据
+            self.training_data = all_features.tolist()
+            self.training_labels = all_labels.tolist()
+
+            # 重新训练模型
+            logger.info(f"🔄 开始增量重训练，总样本数: {len(all_features)} (新增: {len(new_features)})")
+            self.train_model(min_samples=50)  # 降低最小样本要求
+
+            # 清空实盘结果（已用于训练）
+            self.real_trading_results.clear()
+
+            logger.info("✅ 增量重训练完成")
+        except Exception as e:
+            logger.error(f"❌ 增量重训练异常: {str(e)}")
+            traceback.print_exc()
+
+    def pretrain_from_history(self, data_engine, market_analyzer, symbol: str, days: int = 7,
+                              min_samples: int = 100, use_tick: bool = True):
+        """
+        从历史数据预训练模型（严格使用Tick级，保持与实盘一致）
+
+        Args:
+            data_engine: 数据引擎
+            market_analyzer: 市场分析器
+            symbol: 交易品种
+            days: 获取多少天的历史数据（不足会自动扩大，但仅使用Tick）
+            min_samples: 最少需要的训练样本数
+            use_tick: 是否使用Tick级数据（False则直接跳过）
+        """
+        try:
+            if not use_tick:
+                logger.warning("⚠️ 预训练要求Tick级数据，use_tick=False 时跳过")
+                return False
+
+            logger.info(f"🤖 开始从历史数据预训练模型（{days}天，Tick级）...")
+            end_time = datetime.now()
+            min_duration = timedelta(hours=4)  # Tick累计时长至少4小时
+            max_days = max(days, 14)  # 最多扩大到14天
+
+            def fetch_history(start: datetime, end: datetime):
+                local_df = None
+                ticks = mt5.copy_ticks_range(symbol, start, end, mt5.COPY_TICKS_ALL)
+                if ticks is not None and len(ticks) > 0:
+                    logger.info(f"📊 获取到 {len(ticks)} 条Tick数据，用于预训练（{start} - {end}）")
+                    local_df = pd.DataFrame(ticks)
+                    local_df['time'] = pd.to_datetime(local_df['time'], unit='s')
+                    local_df['mid'] = (local_df['bid'] + local_df['ask']) / 2
+                    local_df['spread'] = local_df['ask'] - local_df['bid']
+                    ohlc = local_df.set_index('time')['mid'].resample('5s').ohlc().dropna()
+                    vol = local_df.set_index('time')['volume'].resample('5s').sum()
+                    spread = local_df.set_index('time')['spread'].resample('5s').mean()
+                    local_df = ohlc.join(vol, how='left').join(spread, how='left')
+                    local_df = local_df.rename(columns={'open': 'open', 'high': 'high', 'low': 'low',
+                                                        'close': 'close', 'volume': 'tick_volume'})
+                    local_df = local_df.dropna()
+                if local_df is None or len(local_df) == 0:
+                    return None
+                if 'time' in local_df.columns:
+                    local_df = local_df.set_index('time')
+                local_df = local_df.sort_index()
+                return local_df
+
+            attempt_days = days
+            df = None
+            while attempt_days <= max_days:
+                start_time = end_time - timedelta(days=attempt_days)
+                df = fetch_history(start_time, end_time)
+                if df is None or len(df) == 0:
+                    logger.warning(f"⚠️ Tick历史数据获取失败（尝试 {attempt_days} 天），继续扩大范围...")
+                    attempt_days *= 2
+                    continue
+                duration = df.index.max() - df.index.min()
+                if duration < min_duration:
+                    logger.warning(f"⚠️ Tick数据覆盖时长仅 {duration}, 需要至少 {min_duration}，扩大天数...")
+                    attempt_days *= 2
+                    df = None
+                    continue
+                break
+
+            if df is None or len(df) == 0:
+                logger.warning("⚠️ 无法获取满足时长要求的Tick历史数据，预训练跳过")
+                return False
+
+            duration = df.index.max() - df.index.min()
+            logger.info(f"📊 Tick历史数据覆盖时长: {duration}, 样本条数: {len(df)}")
+            if duration < min_duration:
+                logger.warning(f"⚠️ 仍未达到4小时Tick覆盖，预训练跳过")
+                return False
+
+            if len(df) < 100:
+                logger.warning(f"⚠️ Tick历史数据条数不足（{len(df)} 条），预训练跳过")
+                return False
+
+            training_samples = []
+            training_labels = []
+
+            # 控制样本数量，目标 600-1000 样本（更密集采样）
+            step = max(1, len(df) // 800)
+            max_samples = 1000
+            horizon_bars = 20  # 未来窗口（约100秒），与tick重采样的5s一致
+
+            sample_count = 0
+            for i in range(step, len(df) - horizon_bars - 1, step):
+                try:
+                    hist = df.iloc[max(0, i - 120):i + 1]  # 约10分钟窗口
+                    if len(hist) < 40:
+                        continue
+
+                    closes = hist['close'].values
+                    highs = hist['high'].values
+                    lows = hist['low'].values
+                    volumes = hist['tick_volume'].values if 'tick_volume' in hist.columns else None
+                    spreads = hist['spread'].values if 'spread' in hist.columns else None
+
+                    # 技术指标（保持与实盘特征一致）
+                    rsi = talib.RSI(closes, timeperiod=14)
+                    if len(rsi) == 0 or np.isnan(rsi[-1]):
+                        continue
+                    macd, macd_signal, macd_hist = talib.MACD(closes)
+                    adx = talib.ADX(highs, lows, closes, timeperiod=14)
+                    atr = talib.ATR(highs, lows, closes, timeperiod=14)
+                    ema_5 = talib.EMA(closes, timeperiod=5)
+                    ema_15 = talib.EMA(closes, timeperiod=15)
+                    stoch_k, stoch_d = talib.STOCH(highs, lows, closes)
+                    bb_upper, bb_middle, bb_lower = talib.BBANDS(closes, timeperiod=20)
+
+                    current_price = closes[-1]
+                    current_rsi = rsi[-1]
+                    current_adx = adx[-1]
+                    current_atr = (atr[-1] / current_price) if current_price > 0 else 0
+                    current_macd_hist = macd_hist[-1] if len(macd_hist) > 0 else 0
+                    current_stoch_k = stoch_k[-1]
+                    current_stoch_d = stoch_d[-1] if len(stoch_d) > 0 else 0
+                    ema_alignment = (ema_5[-1] - ema_15[-1]) / ema_15[-1] if ema_15[-1] > 0 else 0
+                    bb_position = (current_price - bb_lower[-1]) / (bb_upper[-1] - bb_lower[-1]) if (bb_upper[-1] -
+                                                                                                     bb_lower[
+                                                                                                         -1]) > 0 else 0.5
+                    price_momentum = (closes[-1] - closes[-10]) / closes[-10] if len(closes) >= 10 and closes[
+                        -10] != 0 else 0
+                    volume_ratio = 1.0
+                    if volumes is not None and len(volumes) > 0:
+                        avg_volume = np.mean(volumes[-30:]) if len(volumes) >= 30 else np.mean(volumes)
+                        recent_volume = np.mean(volumes[-6:]) if len(volumes) >= 6 else volumes[-1]
+                        volume_ratio = recent_volume / avg_volume if avg_volume > 0 else 1.0
+                    spread_mean = np.mean(spreads[-6:]) if spreads is not None and len(spreads) >= 6 else 0
+
+                    # 市场状态近似
+                    if current_adx > 20:
+                        market_state = 'TRENDING'
+                        market_state_confidence = min(1.0, current_adx / 50)
+                    elif current_atr < 0.0004:
+                        market_state = 'RANGING'
+                        market_state_confidence = 0.6
+                    else:
+                        market_state = 'VOLATILE'
+                        market_state_confidence = 0.7
+
+                    signal_strength = min(1.0, abs(price_momentum) * 15)
+                    fusion_confidence = market_state_confidence
+                    consistency = 0.6
+                    trend_start = 1 if 18 < current_adx < 30 else 0
+                    reversal_signal = 1 if (current_rsi < 30 or current_rsi > 70) else 0
+
+                    # ========== 基础特征（16个） ==========
+                    features = [
+                        signal_strength,
+                        fusion_confidence,
+                        consistency,
+                        current_adx,
+                        ema_alignment,
+                        current_macd_hist,
+                        current_rsi,
+                        current_stoch_k,
+                        current_stoch_d,
+                        current_atr,
+                        bb_position,
+                        price_momentum,
+                        volume_ratio,
+                        market_state_confidence,
+                        float(trend_start),
+                        float(reversal_signal)
+                    ]
+
+                    # ========== 序列统计特征（10个） ==========
+                    if len(closes) >= 10:
+                        returns_5 = [(closes[j] - closes[j - 1]) / closes[j - 1] if closes[j - 1] > 0 else 0
+                                     for j in range(max(1, len(closes) - 5), len(closes))]
+                        returns_10 = [(closes[j] - closes[j - 1]) / closes[j - 1] if closes[j - 1] > 0 else 0
+                                      for j in range(max(1, len(closes) - 10), len(closes))]
+                        features.append(np.mean(returns_5) if returns_5 else 0.0)
+                        features.append(np.mean(returns_10) if returns_10 else 0.0)
+                        features.append(np.std(returns_5) if len(returns_5) > 1 else 0.0)
+                        features.append(np.std(returns_10) if len(returns_10) > 1 else 0.0)
+
+                        recent_10 = closes[-10:]
+                        peak = max(recent_10)
+                        trough = min(recent_10)
+                        max_drawdown = (peak - trough) / peak if peak > 0 else 0.0
+                        max_gain = (peak - recent_10[0]) / recent_10[0] if recent_10[0] > 0 else 0.0
+                        features.append(max_drawdown)
+                        features.append(max_gain)
+
+                        if volumes is not None and len(volumes) >= 10:
+                            vol_change = (volumes[-1] - np.mean(volumes[-10:-5])) / np.mean(volumes[-10:-5]) if np.mean(
+                                volumes[-10:-5]) > 0 else 0.0
+                        else:
+                            vol_change = 0.0
+                        features.append(vol_change)
+
+                        vol_percentile = min(1.0, current_atr / (np.std(returns_10) * 100 + 1e-8) if len(
+                            returns_10) > 1 else 0.5)
+                        features.append(vol_percentile)
+
+                        if len(closes) >= 10:
+                            momentum_5 = (closes[-1] - closes[-5]) / closes[-5] if closes[-5] > 0 else 0.0
+                            momentum_10 = (closes[-5] - closes[-10]) / closes[-10] if closes[-10] > 0 else 0.0
+                            momentum_accel = momentum_5 - momentum_10
+                        else:
+                            momentum_accel = 0.0
+                        features.append(momentum_accel)
+
+                        if len(returns_10) >= 3:
+                            price_skew = (np.mean([(r - np.mean(returns_10)) ** 3 for r in returns_10]) /
+                                          (np.std(returns_10) ** 3 + 1e-8)) if np.std(returns_10) > 0 else 0.0
+                        else:
+                            price_skew = 0.0
+                        features.append(price_skew)
+                    else:
+                        features.extend([0.0] * 10)
+
+                    # ========== 结构特征（8个） ==========
+                    if len(closes) >= 20:
+                        recent_highs = highs[-20:] if len(highs) >= 20 else closes[-20:]
+                        recent_lows = lows[-20:] if len(lows) >= 20 else closes[-20:]
+                        resistance = max(recent_highs[:-5]) if len(recent_highs) > 5 else max(
+                            recent_highs) if recent_highs else current_price
+                        support = min(recent_lows[:-5]) if len(recent_lows) > 5 else min(
+                            recent_lows) if recent_lows else current_price
+
+                        features.append((resistance - current_price) / current_price if current_price > 0 else 0.0)
+                        features.append((current_price - support) / current_price if current_price > 0 else 0.0)
+                        features.append((bb_upper[-1] - current_price) / current_price if current_price > 0 else 0.0)
+                        features.append((current_price - bb_lower[-1]) / current_price if current_price > 0 else 0.0)
+
+                        # VWAP近似（使用EMA）
+                        vwap_approx = ema_15[-1] if len(ema_15) > 0 else current_price
+                        features.append((current_price - vwap_approx) / vwap_approx if vwap_approx > 0 else 0.0)
+
+                        recent_high = max(closes[-10:]) if len(closes) >= 10 else current_price
+                        recent_low = min(closes[-10:]) if len(closes) >= 10 else current_price
+                        features.append((recent_high - current_price) / current_price if current_price > 0 else 0.0)
+                        features.append((current_price - recent_low) / current_price if current_price > 0 else 0.0)
+
+                        key_levels = [resistance, support, bb_upper[-1], bb_lower[-1], recent_high, recent_low]
+                        min_distance = min(
+                            [abs(current_price - level) / current_price for level in key_levels if level > 0])
+                        key_proximity = 1.0 / (1.0 + min_distance * 100)
+                        features.append(key_proximity)
+                    else:
+                        features.extend([0.0] * 8)
+
+                    # ========== 多周期特征（6个）- 简化版（使用当前数据模拟） ==========
+                    # 由于预训练时没有实时多周期数据，使用当前周期的长期/短期特征模拟
+                    if len(closes) >= 50:
+                        long_closes = closes[-50:]
+                        long_highs = highs[-50:] if len(highs) >= 50 else long_closes
+                        long_lows = lows[-50:] if len(lows) >= 50 else long_closes
+                        long_adx = talib.ADX(long_highs, long_lows, long_closes, timeperiod=14)
+                        long_rsi = talib.RSI(long_closes, timeperiod=14)
+                        long_ema_5 = talib.EMA(long_closes, timeperiod=5)
+                        long_ema_15 = talib.EMA(long_closes, timeperiod=15)
+
+                        higher_trend = 1.0 if long_closes[-1] > long_ema_15[-1] else (
+                            -1.0 if long_closes[-1] < long_ema_15[-1] else 0.0)
+                        higher_momentum = (long_closes[-1] - long_closes[-10]) / long_closes[-10] if len(
+                            long_closes) >= 10 and long_closes[-10] > 0 else 0.0
+                        higher_adx_val = long_adx[-1] if len(long_adx) > 0 and not np.isnan(long_adx[-1]) else 0.0
+                        higher_rsi_val = long_rsi[-1] if len(long_rsi) > 0 and not np.isnan(long_rsi[-1]) else 50.0
+                        higher_ema_align = (long_ema_5[-1] - long_ema_15[-1]) / long_ema_15[-1] if long_ema_15[
+                                                                                                       -1] > 0 else 0.0
+                        higher_volatility = np.std(long_closes[-20:]) / np.mean(long_closes[-20:]) if np.mean(
+                            long_closes[-20:]) > 0 else 0.0
+
+                        features.append(higher_trend)
+                        features.append(higher_momentum)
+                        features.append(higher_adx_val / 100.0)
+                        features.append(higher_rsi_val / 100.0)
+                        features.append(higher_ema_align)
+                        features.append(higher_volatility)
+                    else:
+                        features.extend([0.0] * 6)
+
+                    # ========== 形态和背离特征（6个） ==========
+                    candle_score = 0.0
+                    if len(closes) >= 3 and len(highs) >= 3 and len(lows) >= 3:
+                        current_close = closes[-1]
+                        prev_close = closes[-2]
+                        current_high = highs[-1] if len(highs) > 0 else current_close
+                        current_low = lows[-1] if len(lows) > 0 else current_close
+                        body = abs(current_close - prev_close)
+                        upper_shadow = current_high - max(current_close, prev_close)
+                        lower_shadow = min(current_close, prev_close) - current_low
+                        if lower_shadow > body * 2 and upper_shadow < body * 0.5:
+                            candle_score = 0.3  # 简化：假设看涨
+                    features.append(candle_score)
+
+                    macd_divergence = 0.0
+                    if len(closes) >= 20:
+                        if closes[-1] > max(closes[-10:-5]) and current_macd_hist < 0:
+                            macd_divergence = -0.5
+                        elif closes[-1] < min(closes[-10:-5]) and current_macd_hist > 0:
+                            macd_divergence = 0.5
+                    features.append(macd_divergence)
+
+                    rsi_divergence = 0.0
+                    if len(closes) >= 20:
+                        if closes[-1] > max(closes[-10:-5]) and current_rsi < 70:
+                            rsi_divergence = -0.5
+                        elif closes[-1] < min(closes[-10:-5]) and current_rsi > 30:
+                            rsi_divergence = 0.5
+                    features.append(rsi_divergence)
+
+                    volume_divergence = 0.0
+                    if volumes is not None and len(volumes) >= 10 and len(closes) >= 10:
+                        price_trend = (closes[-1] - closes[-5]) / closes[-5] if closes[-5] > 0 else 0.0
+                        volume_trend = (np.mean(volumes[-5:]) - np.mean(volumes[-10:-5])) / np.mean(
+                            volumes[-10:-5]) if np.mean(volumes[-10:-5]) > 0 else 0.0
+                        if price_trend > 0 and volume_trend < 0:
+                            volume_divergence = -0.3
+                        elif price_trend < 0 and volume_trend > 0:
+                            volume_divergence = 0.3
+                    features.append(volume_divergence)
+
+                    breakout_confirmation = 0.0
+                    if len(closes) >= 20:
+                        resistance = max(closes[-20:-5]) if len(closes) >= 20 else current_price
+                        support = min(closes[-20:-5]) if len(closes) >= 20 else current_price
+                        if current_price > resistance * 1.001:
+                            breakout_confirmation = 0.5
+                        elif current_price < support * 0.999:
+                            breakout_confirmation = -0.5
+                    features.append(breakout_confirmation)
+
+                    fake_breakout = 0.0
+                    if len(closes) >= 30:
+                        recent_max = max(closes[-10:])
+                        recent_min = min(closes[-10:])
+                        if current_price < recent_max * 0.998 and closes[-5] > recent_max * 1.001:
+                            fake_breakout = -0.5
+                        elif current_price > recent_min * 1.002 and closes[-5] < recent_min * 0.999:
+                            fake_breakout = 0.5
+                    features.append(fake_breakout)
+
+                    # ========== 成本特征（3个） ==========
+                    spread_cost_pct = spread_mean / current_price if current_price > 0 and spread_mean > 0 else 0.0
+                    features.append(spread_cost_pct)
+
+                    commission_per_lot = ProfessionalComplexConfig.COMMISSION_PER_LOT
+                    commission_cost_pct = (commission_per_lot / 100.0) / current_price if current_price > 0 else 0.0
+                    features.append(commission_cost_pct)
+
+                    slippage_estimate_pct = spread_cost_pct * 0.5
+                    features.append(slippage_estimate_pct)
+
+                    # 转换为numpy数组
+                    features = np.array(features, dtype=np.float32)
+
+                    # 确保特征数量匹配
+                    if len(features) < len(self.feature_names):
+                        features = np.pad(features, (0, len(self.feature_names) - len(features)), 'constant')
+                    elif len(features) > len(self.feature_names):
+                        features = features[:len(self.feature_names)]
+
+                    if np.any(np.isnan(features)) or np.any(np.isinf(features)):
+                        continue
+
+                    # ========== 真实回测标签生成（考虑止损止盈和成本） ==========
+                    entry_price = current_price
+                    direction = 'BUY'  # 简化：假设看涨信号（可根据RSI/MACD判断）
+                    if current_rsi > 70 or (current_macd_hist < 0 and price_momentum < 0):
+                        direction = 'SELL'
+
+                    # 计算止损止盈（基于ATR和配置）
+                    atr_value = atr[-1] if len(atr) > 0 else current_price * 0.002
+                    stop_loss_pct = max(0.001, atr_value * 2 / current_price)  # 至少0.1%，或2倍ATR
+                    take_profit_pct = stop_loss_pct * ProfessionalComplexConfig.MIN_RISK_REWARD_RATIO  # 风险回报比
+
+                    # 估算成本
+                    commission = ProfessionalComplexConfig.COMMISSION_PER_LOT
+                    cost_pct_commission = commission / (entry_price * 100) if entry_price > 0 else 0
+                    avg_spread = spread_mean if spreads is not None else (entry_price * 0.0001)  # 默认0.01%
+                    cost_pct_spread = avg_spread / entry_price if entry_price > 0 else 0
+                    slippage_pct = cost_pct_spread * 0.5  # 滑点估计
+                    total_cost_pct = cost_pct_commission + cost_pct_spread + slippage_pct
+
+                    # 模拟真实交易：检查未来价格是否触及止损或止盈
+                    horizons = [horizon_bars, horizon_bars * 3]  # 短/长窗口
+                    label = 0
+                    final_profit_pct = 0.0
+
+                    for h in horizons:
+                        future = df.iloc[i + 1:i + 1 + h]
+                        if len(future) == 0:
+                            continue
+
+                        # 模拟交易路径
+                        if direction == 'BUY':
+                            sl_price = entry_price * (1 - stop_loss_pct)
+                            tp_price = entry_price * (1 + take_profit_pct)
+
+                            # 检查是否先触及止损或止盈
+                            future_low = future['low'].min()
+                            future_high = future['high'].max()
+
+                            if future_low <= sl_price:
+                                # 触及止损
+                                final_profit_pct = -stop_loss_pct - total_cost_pct
+                                break
+                            elif future_high >= tp_price:
+                                # 触及止盈
+                                final_profit_pct = take_profit_pct - total_cost_pct
+                                label = 1
+                                break
+                            else:
+                                # 未触及，使用收盘价计算盈亏
+                                exit_price = future['close'].iloc[-1]
+                                raw_profit_pct = (exit_price - entry_price) / entry_price
+                                final_profit_pct = raw_profit_pct - total_cost_pct
+
+                                # 如果盈利足够（超过成本+安全边际），标记为成功
+                                if final_profit_pct > max(0.0003, total_cost_pct * 1.5):
+                                    label = 1
+                                    break
+                        else:  # SELL
+                            sl_price = entry_price * (1 + stop_loss_pct)
+                            tp_price = entry_price * (1 - take_profit_pct)
+
+                            future_high = future['high'].max()
+                            future_low = future['low'].min()
+
+                            if future_high >= sl_price:
+                                # 触及止损
+                                final_profit_pct = -stop_loss_pct - total_cost_pct
+                                break
+                            elif future_low <= tp_price:
+                                # 触及止盈
+                                final_profit_pct = take_profit_pct - total_cost_pct
+                                label = 1
+                                break
+                            else:
+                                exit_price = future['close'].iloc[-1]
+                                raw_profit_pct = (entry_price - exit_price) / entry_price
+                                final_profit_pct = raw_profit_pct - total_cost_pct
+
+                                if final_profit_pct > max(0.0003, total_cost_pct * 1.5):
+                                    label = 1
+                                    break
+
+                    # 如果最终亏损，确保标签为0
+                    if final_profit_pct <= 0:
+                        label = 0
+
+                    training_samples.append(features)
+                    training_labels.append(label)
+                    sample_count += 1
+
+                    if sample_count >= max_samples:
+                        break
+                except Exception as e:
+                    logger.debug(f"处理历史数据样本时异常: {str(e)}")
+                    continue
+
+            if len(training_samples) < min_samples:
+                logger.warning(f"⚠️ 历史数据生成的训练样本不足: {len(training_samples)} < {min_samples}，预训练跳过")
+                return False
+
+            logger.info(f"📊 从历史数据生成 {len(training_samples)} 个训练样本（tick级预训练）")
+            self.training_data.extend(training_samples)
+            self.training_labels.extend(training_labels)
+
+            return self.train_model(min_samples=min_samples)
+
+        except Exception as e:
+            logger.error(f"❌ 历史数据预训练异常: {str(e)}")
+            traceback.print_exc()
+            return False
 
 
 class DQNAgent:
@@ -5282,18 +6290,43 @@ class RLSignalMiner:
     def __init__(self, data_engine: ProfessionalTickDataEngine):
 
         self.data_engine = data_engine
-
         self.agent = DQNAgent(state_size=25, action_size=10)
-
         self.discovered_patterns = []  # 发现的信号模式
-
         self.pattern_performance = {}  # 模式表现记录
 
+        # 持久化路径
+        self.model_path = "rl_signal_miner_model.pth"
+        self.memory_path = "rl_signal_miner_memory.pkl"
+
         # 信号挖掘参数
-
         self.min_pattern_samples = 20  # 最小样本数才认为模式有效
-
         self.min_pattern_win_rate = 0.55  # 最小胜率
+
+        # 尝试加载已有模型与经验池
+        self._load_checkpoint()
+
+    def _load_checkpoint(self):
+        try:
+            if os.path.exists(self.model_path):
+                self.agent.load_model(self.model_path)
+                logger.info(f"✅ 已加载RL信号挖掘器模型: {self.model_path}")
+            if os.path.exists(self.memory_path):
+                with open(self.memory_path, "rb") as f:
+                    mem_list = pickle.load(f)
+                    self.agent.memory = deque(mem_list, maxlen=10000)
+                logger.info(f"✅ 已加载RL信号挖掘器经验池: {len(self.agent.memory)} 条")
+        except Exception as e:
+            logger.warning(f"⚠️ 加载RL信号挖掘器模型/经验池失败: {str(e)}")
+
+    def save_checkpoint(self):
+        """保存模型与经验池"""
+        try:
+            self.agent.save_model(self.model_path)
+            with open(self.memory_path, "wb") as f:
+                pickle.dump(list(self.agent.memory), f)
+            logger.info(f"💾 RL信号挖掘器已保存: 模型={self.model_path}, 经验池={self.memory_path}")
+        except Exception as e:
+            logger.warning(f"⚠️ 保存RL信号挖掘器失败: {str(e)}")
 
     def get_state_features(self, indicators: Dict, market_state: str) -> np.ndarray:
 
@@ -5642,6 +6675,36 @@ class RLSignalQualityEvaluator:
         self.agent = DQNAgent(state_size=25, action_size=5)  # 5个质量等级
 
         self.evaluation_history = deque(maxlen=1000)
+
+        # 持久化路径
+        self.model_path = "rl_quality_evaluator_model.pth"
+        self.memory_path = "rl_quality_evaluator_memory.pkl"
+
+        # 尝试加载已保存的模型与经验池
+        self._load_checkpoint()
+
+    def _load_checkpoint(self):
+        try:
+            if os.path.exists(self.model_path):
+                self.agent.load_model(self.model_path)
+                logger.info(f"✅ 已加载RL质量评估器模型: {self.model_path}")
+            if os.path.exists(self.memory_path):
+                with open(self.memory_path, "rb") as f:
+                    mem_list = pickle.load(f)
+                    self.agent.memory = deque(mem_list, maxlen=10000)
+                logger.info(f"✅ 已加载RL质量评估器经验池: {len(self.agent.memory)} 条")
+        except Exception as e:
+            logger.warning(f"⚠️ 加载RL质量评估器模型/经验池失败: {str(e)}")
+
+    def save_checkpoint(self):
+        """保存模型与经验池"""
+        try:
+            self.agent.save_model(self.model_path)
+            with open(self.memory_path, "wb") as f:
+                pickle.dump(list(self.agent.memory), f)
+            logger.info(f"💾 RL质量评估器已保存: 模型={self.model_path}, 经验池={self.memory_path}")
+        except Exception as e:
+            logger.warning(f"⚠️ 保存RL质量评估器失败: {str(e)}")
 
     def get_state_features(self, signal: Dict, indicators: Dict, market_state: str) -> np.ndarray:
 
@@ -7712,6 +8775,228 @@ class AutoSignalFactorMiner:
             if not self.factor_performance:
                 self.factor_performance = {}
 
+    def _validate_reversal_signal(self, signal: Dict, indicators: Dict, current_price: float) -> Dict[str, Any]:
+        """
+        增强反转信号验证：多周期确认、结构确认、形态确认、二次确认
+
+        Returns:
+            Dict包含: valid(bool), reason(str), confidence_boost(float)
+        """
+        try:
+            direction = signal.get('direction', 'BUY')
+            validation_score = 0.0
+            max_score = 10.0
+            reasons = []
+
+            prices = list(self.data_engine.price_buffer) if hasattr(self.data_engine, 'price_buffer') else []
+            highs = list(self.data_engine.high_buffer) if hasattr(self.data_engine, 'high_buffer') else []
+            lows = list(self.data_engine.low_buffer) if hasattr(self.data_engine, 'low_buffer') else []
+
+            # ========== 1. 多周期确认（2分） ==========
+            try:
+                higher_tf_data = self.data_engine._get_candle_data(mt5.TIMEFRAME_M15, 50) if hasattr(self.data_engine,
+                                                                                                     '_get_candle_data') else None
+                if higher_tf_data is not None and len(higher_tf_data) >= 20:
+                    higher_closes = higher_tf_data['close']
+                    higher_highs = higher_tf_data['high']
+                    higher_lows = higher_tf_data['low']
+
+                    # 计算更高时间框架的趋势
+                    higher_ema_5 = talib.EMA(higher_closes, timeperiod=5)
+                    higher_ema_15 = talib.EMA(higher_closes, timeperiod=15)
+                    higher_rsi = talib.RSI(higher_closes, timeperiod=14)
+
+                    if len(higher_ema_5) > 0 and len(higher_ema_15) > 0:
+                        higher_trend_up = higher_closes[-1] > higher_ema_15[-1] and higher_ema_5[-1] > higher_ema_15[-1]
+                        higher_trend_down = higher_closes[-1] < higher_ema_15[-1] and higher_ema_5[-1] < higher_ema_15[
+                            -1]
+
+                        # 如果更高时间框架趋势与反转方向一致，加分
+                        if direction == 'BUY' and (higher_trend_down or higher_rsi[-1] < 40):
+                            validation_score += 1.0
+                            reasons.append("更高周期支持看涨反转")
+                        elif direction == 'SELL' and (higher_trend_up or higher_rsi[-1] > 60):
+                            validation_score += 1.0
+                            reasons.append("更高周期支持看跌反转")
+                        # 如果更高周期仍在强趋势中，扣分
+                        elif direction == 'BUY' and higher_trend_up and higher_rsi[-1] > 70:
+                            validation_score -= 0.5
+                            reasons.append("更高周期仍在强上涨趋势")
+                        elif direction == 'SELL' and higher_trend_down and higher_rsi[-1] < 30:
+                            validation_score -= 0.5
+                            reasons.append("更高周期仍在强下跌趋势")
+            except Exception as e:
+                logger.debug(f"多周期确认异常: {str(e)}")
+
+            # ========== 2. 结构确认（3分） ==========
+            if len(prices) >= 20:
+                # 关键价位确认
+                recent_highs = highs[-20:] if len(highs) >= 20 else prices[-20:]
+                recent_lows = lows[-20:] if len(lows) >= 20 else prices[-20:]
+                resistance = max(recent_highs[:-5]) if len(recent_highs) > 5 else max(
+                    recent_highs) if recent_highs else current_price
+                support = min(recent_lows[:-5]) if len(recent_lows) > 5 else min(
+                    recent_lows) if recent_lows else current_price
+
+                # 检查是否接近关键价位
+                resistance_distance = abs(current_price - resistance) / current_price if current_price > 0 else 1.0
+                support_distance = abs(current_price - support) / current_price if current_price > 0 else 1.0
+
+                if direction == 'BUY':
+                    # 看涨反转：应该在支撑位附近
+                    if support_distance < 0.001:  # 接近支撑位
+                        validation_score += 1.5
+                        reasons.append("价格接近支撑位")
+                    elif current_price <= support * 1.002:  # 在支撑位附近
+                        validation_score += 1.0
+                        reasons.append("价格在支撑位附近")
+                    # 如果远离支撑位，扣分
+                    elif current_price > support * 1.005:
+                        validation_score -= 0.5
+                        reasons.append("价格远离支撑位")
+                else:  # SELL
+                    if resistance_distance < 0.001:
+                        validation_score += 1.5
+                        reasons.append("价格接近阻力位")
+                    elif current_price >= resistance * 0.998:
+                        validation_score += 1.0
+                        reasons.append("价格在阻力位附近")
+                    elif current_price < resistance * 0.995:
+                        validation_score -= 0.5
+                        reasons.append("价格远离阻力位")
+
+                # 布林带位置确认
+                bb_position = indicators.get('BB_POSITION', 0.5)
+                if direction == 'BUY' and bb_position < 0.2:
+                    validation_score += 0.5
+                    reasons.append("价格在布林带下轨")
+                elif direction == 'SELL' and bb_position > 0.8:
+                    validation_score += 0.5
+                    reasons.append("价格在布林带上轨")
+
+            # ========== 3. 形态确认（2分） ==========
+            if len(prices) >= 10 and len(highs) >= 10 and len(lows) >= 10:
+                # 检查K线形态
+                recent_closes = prices[-5:]
+                recent_highs_list = highs[-5:] if len(highs) >= 5 else prices[-5:]
+                recent_lows_list = lows[-5:] if len(lows) >= 5 else prices[-5:]
+
+                # 锤子线/上吊线
+                if len(recent_closes) >= 2:
+                    current_close = recent_closes[-1]
+                    prev_close = recent_closes[-2]
+                    current_high = recent_highs_list[-1]
+                    current_low = recent_lows_list[-1]
+                    body = abs(current_close - prev_close)
+                    upper_shadow = current_high - max(current_close, prev_close)
+                    lower_shadow = min(current_close, prev_close) - current_low
+
+                    if direction == 'BUY' and lower_shadow > body * 2 and upper_shadow < body * 0.5:
+                        validation_score += 1.0
+                        reasons.append("出现看涨锤子线形态")
+                    elif direction == 'SELL' and upper_shadow > body * 2 and lower_shadow < body * 0.5:
+                        validation_score += 1.0
+                        reasons.append("出现看跌上吊线形态")
+
+                # 吞没形态
+                if len(recent_closes) >= 3:
+                    # 定义变量（两个分支都需要）
+                    prev2_close = recent_closes[-3]
+                    prev_close = recent_closes[-2]
+                    curr_close = recent_closes[-1]
+
+                    if direction == 'BUY':
+                        # 看涨吞没：前一根阴线，当前阳线完全吞没
+                        if prev_close < prev2_close and curr_close > prev_close and curr_close > prev2_close:
+                            validation_score += 1.0
+                            reasons.append("出现看涨吞没形态")
+                    else:  # SELL
+                        # 看跌吞没：前一根阳线，当前阴线完全吞没
+                        if prev_close > prev2_close and curr_close < prev_close and curr_close < prev2_close:
+                            validation_score += 1.0
+                            reasons.append("出现看跌吞没形态")
+
+            # ========== 4. 背离确认（2分） ==========
+            rsi_14 = indicators.get('RSI_14', 50.0)
+            macd_hist = indicators.get('MACD_HIST', 0.0)
+
+            if len(prices) >= 20:
+                # RSI背离
+                if direction == 'BUY':
+                    # 看涨背离：价格创新低但RSI未创新低
+                    recent_low = min(prices[-10:])
+                    prev_low = min(prices[-20:-10])
+                    if prices[-1] < prev_low and rsi_14 > 30:
+                        validation_score += 1.0
+                        reasons.append("RSI看涨背离")
+                else:  # SELL
+                    recent_high = max(prices[-10:])
+                    prev_high = max(prices[-20:-10])
+                    if prices[-1] > prev_high and rsi_14 < 70:
+                        validation_score += 1.0
+                        reasons.append("RSI看跌背离")
+
+                # MACD背离
+                if direction == 'BUY' and macd_hist > 0 and prices[-1] < min(prices[-10:-5]):
+                    validation_score += 1.0
+                    reasons.append("MACD看涨背离")
+                elif direction == 'SELL' and macd_hist < 0 and prices[-1] > max(prices[-10:-5]):
+                    validation_score += 1.0
+                    reasons.append("MACD看跌背离")
+
+            # ========== 5. 成交量确认（1分） ==========
+            volume_ratio = indicators.get('VOLUME_RATIO', 1.0)
+            if direction == 'BUY' and volume_ratio > 1.2:
+                validation_score += 0.5
+                reasons.append("成交量放大支持看涨")
+            elif direction == 'SELL' and volume_ratio > 1.2:
+                validation_score += 0.5
+                reasons.append("成交量放大支持看跌")
+            elif volume_ratio < 0.8:
+                validation_score -= 0.3
+                reasons.append("成交量萎缩，反转信号减弱")
+
+            # ========== 6. 波动率确认（0.5分） ==========
+            atr_percent = indicators.get('ATR_PERCENT', 0.0)
+            if atr_percent > 0.0003:  # 有一定波动率
+                validation_score += 0.5
+                reasons.append("波动率充足")
+            elif atr_percent < 0.0001:  # 波动率过低
+                validation_score -= 0.3
+                reasons.append("波动率过低，可能假信号")
+
+            # ========== 综合判断 ==========
+            # 至少需要5分（50%）才能通过验证
+            min_required_score = 5.0
+            is_valid = validation_score >= min_required_score
+
+            # 计算置信度提升（基于验证分数）
+            confidence_boost = max(0.0, (validation_score - min_required_score) / max_score * 0.2)  # 最多提升20%
+
+            reason_str = "; ".join(reasons) if reasons else "无特殊确认"
+            if not is_valid:
+                reason_str = f"验证分数不足({validation_score:.1f}/{max_score:.1f}): {reason_str}"
+
+            return {
+                'valid': is_valid,
+                'reason': reason_str,
+                'score': validation_score,
+                'max_score': max_score,
+                'confidence_boost': confidence_boost,
+                'details': reasons
+            }
+
+        except Exception as e:
+            logger.warning(f"反转信号验证异常: {str(e)}")
+            return {
+                'valid': True,  # 异常时允许通过，避免过度过滤
+                'reason': f"验证异常: {str(e)}",
+                'score': 5.0,
+                'max_score': 10.0,
+                'confidence_boost': 0.0,
+                'details': []
+            }
+
 
 class ProfessionalSignalGenerator:
     """专业信号生成器 - 基于市场状态和多重指标"""
@@ -7911,6 +9196,14 @@ class ProfessionalSignalGenerator:
                     # 先尝试生成信号，如果是趋势启动信号则允许
                     pass  # 不在这里直接返回，让信号生成函数先尝试
 
+            # 添加市场状态和关键指标的调试日志
+            logger.debug(f"🔍 [信号生成] 市场状态={market_state}, 置信度={state_confidence:.2f}, "
+                         f"当前价格={current_price:.2f}, ADX={indicators.get('ADX', 0):.2f}, "
+                         f"EMA对齐={ema_alignment:.3f}, EMA趋势={ema_trend}, "
+                         f"MACD趋势={indicators.get('MACD_TREND', 0):.3f}, "
+                         f"RSI={indicators.get('RSI_14', 50):.2f}, "
+                         f"价格动量={indicators.get('PRICE_MOMENTUM', {}).get('momentum', 0) if isinstance(indicators.get('PRICE_MOMENTUM'), dict) else 0:.6f}")
+
             # 根据市场状态生成信号
 
             signal = None
@@ -7918,25 +9211,37 @@ class ProfessionalSignalGenerator:
             if market_state == 'TRENDING':
 
                 signal = self._generate_trending_signal(indicators, current_price, spread)
+                if signal:
+                    logger.debug(f"🔍 [信号生成] 趋势市信号生成: 方向={signal.get('direction')}, "
+                                 f"强度={signal.get('strength', 0):.2f}, 类型={signal.get('signal_type', 'UNKNOWN')}, "
+                                 f"领先方向={signal.get('leading_direction', 'N/A')}, "
+                                 f"综合得分={signal.get('final_score', 'N/A')}")
 
             elif market_state == 'RANGING':
 
                 signal = self._generate_ranging_signal(indicators, current_price, spread)
+                if signal:
+                    logger.debug(f"🔍 [信号生成] 震荡市信号生成: 方向={signal.get('direction')}, "
+                                 f"强度={signal.get('strength', 0):.2f}, 反转={signal.get('reversal_signal', False)}")
 
             elif market_state == 'VOLATILE':
 
                 signal = self._generate_volatile_signal(indicators, current_price, spread)
+                if signal:
+                    logger.debug(f"🔍 [信号生成] 波动市信号生成: 方向={signal.get('direction')}, "
+                                 f"强度={signal.get('strength', 0):.2f}")
 
             if signal:
 
                 # 检查是否为趋势启动信号（优先处理，放宽要求）
                 is_trend_start_signal = signal.get('trend_start', False) or signal.get('signal_type') == 'EARLY_TREND'
 
-                # 记录信号生成日志
-                logger.info(f"🔍 信号已生成: {signal.get('direction', 'UNKNOWN')} "
-                            f"强度: {signal.get('strength', 0):.2f}, "
-                            f"类型: {'趋势启动' if is_trend_start_signal else '常规'}, "
-                            f"EMA趋势: {ema_trend}, EMA对齐: {ema_alignment:.2f}")
+                # 记录信号生成日志（增强版）
+                logger.info(f"🔍 [信号生成] 信号已生成: 方向={signal.get('direction', 'UNKNOWN')}, "
+                            f"强度={signal.get('strength', 0):.2f}, "
+                            f"类型={'趋势启动' if is_trend_start_signal else ('反转' if signal.get('reversal_signal') else '常规')}, "
+                            f"EMA趋势={ema_trend}, EMA对齐={ema_alignment:.2f}, "
+                            f"当前价格={current_price:.2f}")
 
                 # 如果EMA趋势不明确且对齐度不足，但信号是趋势启动信号，允许通过
                 if ema_trend == 'UNCERTAIN' and abs(ema_alignment) <= 0.2:
@@ -7963,7 +9268,8 @@ class ProfessionalSignalGenerator:
                         f"✅ [generate_trading_signal] 信号强度检查通过: {signal_strength:.2f} >= {min_strength:.2f}")
 
                     # 使用ML评估信号质量
-                    logger.info(f"🔍 [generate_trading_signal] 开始ML评估信号质量...")
+                    logger.info(f"🔍 [generate_trading_signal] 开始ML评估信号质量: 方向={signal.get('direction')}, "
+                                f"强度={signal_strength:.2f}, ML训练状态={self.ml_evaluator.is_trained}")
                     ml_evaluation = self.ml_evaluator.evaluate_signal(
 
                         signal, indicators, market_state, state_confidence, self.data_engine
@@ -7975,7 +9281,11 @@ class ProfessionalSignalGenerator:
                         return None
 
                     logger.info(
-                        f"✅ [generate_trading_signal] ML评估完成: 质量评分={ml_evaluation.get('quality_score', 0):.2f}, 成功率={ml_evaluation.get('success_probability', 0):.2%}")
+                        f"✅ [generate_trading_signal] ML评估完成: 方向={signal.get('direction')}, "
+                        f"质量评分={ml_evaluation.get('quality_score', 0):.2f}, "
+                        f"成功率={ml_evaluation.get('success_probability', 0):.2%}, "
+                        f"推荐={ml_evaluation.get('recommendation', 'N/A')}, "
+                        f"ML预测={ml_evaluation.get('ml_prediction', False)}")
 
                     # 将ML评估结果添加到信号中
 
@@ -8156,23 +9466,42 @@ class ProfessionalSignalGenerator:
 
                         return None
 
-                    # 添加成功率过滤（ML已训练时要求最小成功率≥60%）
+                    # 动态成功率过滤（按信号类型与模型状态调整）- 降低阈值避免过度过滤
+                    success_prob = ml_evaluation.get('success_probability', 0)
+                    # 若模型概率缺失或为0，直接使用0（不进行兜底估计）
+                    if success_prob <= 0:
+                        success_prob = 0.0
+
                     if self.ml_evaluator.is_trained:
-                        min_success_probability = 0.60  # 最小成功率60%
-                        success_prob = ml_evaluation.get('success_probability', 0)
+                        # ML已训练：使用降低后的分层阈值
+                        if signal.get('reversal_signal', False):
+                            min_success_probability = 0.55  # 反转信号：从0.70降低到0.55
+                        elif signal.get('trend_start', False) or signal.get('signal_type') == 'EARLY_TREND':
+                            min_success_probability = 0.35  # 趋势启动：从0.30提高到0.35（更合理）
+                        else:
+                            min_success_probability = 0.40  # 普通信号：从0.50降低到0.40
+                    else:
+                        # ML未训练：大幅放宽阈值，主要依赖信号强度
+                        if signal.get('reversal_signal', False):
+                            min_success_probability = 0.35  # 反转：从0.50降低到0.35
+                        elif signal.get('trend_start', False) or signal.get('signal_type') == 'EARLY_TREND':
+                            min_success_probability = 0.15  # 趋势启动：从0.20降低到0.15
+                        else:
+                            min_success_probability = 0.20  # 普通信号：从0.30降低到0.20
+
                         logger.info(
-                            f"📊 [generate_trading_signal] 成功率检查: {success_prob:.2%} >= {min_success_probability:.2%}? {success_prob >= min_success_probability}")
+                            f"📊 [generate_trading_signal] 成功率检查: {success_prob:.2%} >= {min_success_probability:.2%}? "
+                            f"{success_prob >= min_success_probability}, ML训练={self.ml_evaluator.is_trained}, "
+                            f"信号类型={'反转' if signal.get('reversal_signal') else '趋势启动' if signal.get('trend_start') else '普通'}")
 
                         if success_prob < min_success_probability:
                             logger.warning(
                                 f"⏸️ [generate_trading_signal] 信号成功率不足，拒绝信号: {signal.get('direction', 'UNKNOWN')} "
                                 f"成功率: {success_prob:.2%} < {min_success_probability:.2%}, "
                                 f"质量评分: {ml_evaluation['quality_score']:.2f}, "
+                                f"信号强度: {signal.get('strength', 0):.2f}, "
                                 f"市场状态: {market_state}")
                             return None
-                        else:
-                            logger.info(
-                                f"✅ [generate_trading_signal] 成功率检查通过: {success_prob:.2%} >= {min_success_probability:.2%}")
 
                     # 对于反转信号，需要更高的质量评分
 
@@ -8241,13 +9570,28 @@ class ProfessionalSignalGenerator:
                     # 详细日志
 
                     # 增强方向确认（对所有信号）
+                    logger.debug(f"🔍 [方向确认] 开始验证信号方向: {signal.get('direction')}, "
+                                 f"当前价格={indicators.get('CURRENT_PRICE', 0):.2f}")
                     signal = self._enhance_direction_confirmation(signal, indicators)
 
                     # 如果方向确认不足，拒绝信号（提高阈值到50%以提高方向准确性）
                     confirmation = signal.get('direction_confirmation', {})
-                    if confirmation.get('consistency', 1.0) < 0.50:  # 一致性低于50%（从25%提高到50%）
+                    consistency = confirmation.get('consistency', 1.0)
+                    confirmation_score = confirmation.get('score', 0)
+                    confirmation_count = confirmation.get('count', 0)
+
+                    logger.info(f"🔍 [方向确认结果] 信号方向={signal.get('direction')}, "
+                                f"一致性={consistency:.2%}, "
+                                f"确认分数={confirmation_score:.2f}, "
+                                f"确认数量={confirmation_count}, "
+                                f"RSI={indicators.get('RSI_14', 50):.2f}, "
+                                f"MACD趋势={indicators.get('MACD_TREND', 0):.3f}, "
+                                f"EMA对齐={indicators.get('EMA_ALIGNMENT', 0):.3f}")
+
+                    if consistency < 0.50:  # 一致性低于50%
                         logger.warning(f"⏸️ [generate_trading_signal] 信号方向确认不足，拒绝信号: "
-                                       f"一致性: {confirmation.get('consistency', 0):.2%} < 50%")
+                                       f"一致性: {consistency:.2%} < 50%, "
+                                       f"确认分数={confirmation_score:.2f}, 确认数量={confirmation_count}")
                         return None
 
                     # 计算预期止盈
@@ -8359,32 +9703,50 @@ class ProfessionalSignalGenerator:
         volume_confirmed = False
         volume_ratio = 1.0
 
+        logger.debug(f"🔍 [方向确认] 开始验证信号方向: {direction}")
+
         # 1. RSI确认
         rsi_14 = indicators.get('RSI_14', 50)
         if direction == 'BUY' and rsi_14 < 50:
             confirmation_score += 0.15
             confirmation_count += 1
+            logger.debug(f"🔍 [方向确认] RSI确认: RSI={rsi_14:.2f} < 50 → BUY方向一致, score={confirmation_score:.2f}")
         elif direction == 'SELL' and rsi_14 > 50:
             confirmation_score += 0.15
             confirmation_count += 1
+            logger.debug(f"🔍 [方向确认] RSI确认: RSI={rsi_14:.2f} > 50 → SELL方向一致, score={confirmation_score:.2f}")
+        else:
+            logger.debug(f"🔍 [方向确认] RSI不一致: RSI={rsi_14:.2f}, 信号方向={direction}")
 
         # 2. MACD确认
         macd_trend = indicators.get('MACD_TREND', 0)
         if direction == 'BUY' and macd_trend > 0:
             confirmation_score += 0.15
             confirmation_count += 1
+            logger.debug(
+                f"🔍 [方向确认] MACD确认: MACD_TREND={macd_trend:.3f} > 0 → BUY方向一致, score={confirmation_score:.2f}")
         elif direction == 'SELL' and macd_trend < 0:
             confirmation_score += 0.15
             confirmation_count += 1
+            logger.debug(
+                f"🔍 [方向确认] MACD确认: MACD_TREND={macd_trend:.3f} < 0 → SELL方向一致, score={confirmation_score:.2f}")
+        else:
+            logger.debug(f"🔍 [方向确认] MACD不一致: MACD_TREND={macd_trend:.3f}, 信号方向={direction}")
 
         # 3. EMA对齐确认
         ema_alignment = indicators.get('EMA_ALIGNMENT', 0)
         if direction == 'BUY' and ema_alignment > 0.1:
             confirmation_score += 0.15
             confirmation_count += 1
+            logger.debug(
+                f"🔍 [方向确认] EMA对齐确认: EMA_ALIGNMENT={ema_alignment:.3f} > 0.1 → BUY方向一致, score={confirmation_score:.2f}")
         elif direction == 'SELL' and ema_alignment < -0.1:
             confirmation_score += 0.15
             confirmation_count += 1
+            logger.debug(
+                f"🔍 [方向确认] EMA对齐确认: EMA_ALIGNMENT={ema_alignment:.3f} < -0.1 → SELL方向一致, score={confirmation_score:.2f}")
+        else:
+            logger.debug(f"🔍 [方向确认] EMA对齐不一致: EMA_ALIGNMENT={ema_alignment:.3f}, 信号方向={direction}")
 
         # 4. ADX趋势强度确认
         adx = indicators.get('ADX', 0)
@@ -8549,6 +9911,9 @@ class ProfessionalSignalGenerator:
                 'consistency': consistency_ratio,
                 'warning': '方向确认不足，信号强度已降低'
             }
+            logger.warning(f"⚠️ [方向确认] 信号方向={direction}, 一致性不足: {consistency_ratio:.2%} < 50%, "
+                           f"确认分数={confirmation_score:.2f}, 确认数量={confirmation_count}, "
+                           f"信号强度已降低至{signal['strength']:.2f}")
         else:
             signal['direction_confirmation'] = {
                 'score': confirmation_score,
@@ -8559,6 +9924,12 @@ class ProfessionalSignalGenerator:
             # 如果一致性很高，增强信号
             if consistency_ratio > 0.7:
                 signal['strength'] = min(1.0, signal.get('strength', 0.5) * 1.1)  # 增强10%
+                logger.info(f"✅ [方向确认] 信号方向={direction}, 一致性高: {consistency_ratio:.2%} > 70%, "
+                            f"确认分数={confirmation_score:.2f}, 确认数量={confirmation_count}, "
+                            f"信号强度已增强至{signal['strength']:.2f}")
+            else:
+                logger.info(f"✅ [方向确认] 信号方向={direction}, 一致性: {consistency_ratio:.2%}, "
+                            f"确认分数={confirmation_score:.2f}, 确认数量={confirmation_count}")
 
         return signal
 
@@ -8596,7 +9967,7 @@ class ProfessionalSignalGenerator:
                     # 止盈不应超过阻力位太多
                     max_tp = resistance * 1.002  # 阻力位上方0.2%
                     calculated_tp = current_price + atr_value * 2.5 * market_factor * (
-                                quality_score + signal_strength) / 2
+                            quality_score + signal_strength) / 2
                     return min(calculated_tp, max_tp)
             else:  # SELL
                 support = support_resistance.get('support', None)
@@ -8604,7 +9975,7 @@ class ProfessionalSignalGenerator:
                     # 止盈不应低于支撑位太多
                     min_tp = support * 0.998  # 支撑位下方0.2%
                     calculated_tp = current_price - atr_value * 2.5 * market_factor * (
-                                quality_score + signal_strength) / 2
+                            quality_score + signal_strength) / 2
                     return max(calculated_tp, min_tp)
 
         # 基础计算：ATR倍数 × 市场因子 × 质量因子
@@ -8928,8 +10299,10 @@ class ProfessionalSignalGenerator:
 
             if direction != 0:
                 signal_strength = min(1.0, confidence * 1.2)  # 增强早期信号强度
+                signal_direction = 'BUY' if direction == 1 else 'SELL'
                 logger.info(
-                    f"🚀 检测到趋势启动信号: {direction_str} 置信度: {confidence:.2f}, 信号强度: {signal_strength:.2f}")
+                    f"🚀 [趋势启动信号] 方向={signal_direction}({direction}), 原始方向={direction_str}, "
+                    f"置信度={confidence:.2f}, 信号强度={signal_strength:.2f}, 当前价格={current_price:.2f}")
                 return {
 
                     'direction': 'BUY' if direction == 1 else 'SELL',
@@ -8970,12 +10343,16 @@ class ProfessionalSignalGenerator:
                 leading_indicators_score += 0.25
 
                 leading_direction = 1
+                logger.debug(f"🔍 [趋势信号] 价格动量: {momentum_value:.6f} > 0.0001 → 看涨方向(1)")
 
             elif momentum_value < -0.0001:  # 下跌动量
 
                 leading_indicators_score -= 0.25
 
                 leading_direction = -1
+                logger.debug(f"🔍 [趋势信号] 价格动量: {momentum_value:.6f} < -0.0001 → 看跌方向(-1)")
+            else:
+                logger.debug(f"🔍 [趋势信号] 价格动量: {momentum_value:.6f} (无明确方向)")
 
             # 加速度加成（权重15%）
 
@@ -9008,6 +10385,8 @@ class ProfessionalSignalGenerator:
 
                 if leading_direction == 0:
                     leading_direction = 1
+                logger.debug(
+                    f"🔍 [趋势信号] Tick动量: {tick_momentum} > 2 → 看涨, leading_direction={leading_direction}")
 
             elif tick_momentum < -2:  # 连续看跌
 
@@ -9015,6 +10394,8 @@ class ProfessionalSignalGenerator:
 
                 if leading_direction == 0:
                     leading_direction = -1
+                logger.debug(
+                    f"🔍 [趋势信号] Tick动量: {tick_momentum} < -2 → 看跌, leading_direction={leading_direction}")
 
         # 1.3 订单流（权重10%）
 
@@ -9030,6 +10411,8 @@ class ProfessionalSignalGenerator:
 
                 if leading_direction == 0:
                     leading_direction = 1
+                logger.debug(
+                    f"🔍 [趋势信号] 订单流不平衡: {of_imbalance:.3f} > 0.3 → 买压强, leading_direction={leading_direction}")
 
             elif of_imbalance < -0.3:  # 卖压强
 
@@ -9037,6 +10420,8 @@ class ProfessionalSignalGenerator:
 
                 if leading_direction == 0:
                     leading_direction = -1
+                logger.debug(
+                    f"🔍 [趋势信号] 订单流不平衡: {of_imbalance:.3f} < -0.3 → 卖压强, leading_direction={leading_direction}")
 
         # ========== 2. 滞后指标作为确认（权重40%，降低依赖）==========
 
@@ -9049,10 +10434,14 @@ class ProfessionalSignalGenerator:
         if macd_trend > 0:
 
             lagging_indicators_score += 0.15
+            logger.debug(
+                f"🔍 [趋势信号] MACD趋势: {macd_trend:.3f} > 0 → 看涨, lagging_score={lagging_indicators_score:.3f}")
 
         elif macd_trend < 0:
 
             lagging_indicators_score -= 0.15
+            logger.debug(
+                f"🔍 [趋势信号] MACD趋势: {macd_trend:.3f} < 0 → 看跌, lagging_score={lagging_indicators_score:.3f}")
 
         # 2.2 ADX（权重15%，趋势强度确认）
 
@@ -9085,42 +10474,86 @@ class ProfessionalSignalGenerator:
         if ema_alignment > 0.2:
 
             lagging_indicators_score += 0.10
+            logger.debug(
+                f"🔍 [趋势信号] EMA对齐: {ema_alignment:.3f} > 0.2 → 看涨, lagging_score={lagging_indicators_score:.3f}")
 
         elif ema_alignment < -0.2:
 
             lagging_indicators_score -= 0.10
+            logger.debug(
+                f"🔍 [趋势信号] EMA对齐: {ema_alignment:.3f} < -0.2 → 看跌, lagging_score={lagging_indicators_score:.3f}")
 
         # ========== 3. 综合评分（领先指标权重更高）==========
 
         final_score = leading_indicators_score * 0.60 + lagging_indicators_score * 0.40
 
-        # 确定方向（优先使用领先指标的方向）
+        # 确定方向（优先使用领先指标的方向，但需要检测方向冲突）
+        direction = 0
 
         if leading_direction != 0:
-
+            # 优先使用领先指标方向
             direction = leading_direction
 
-        else:
-
-            # 如果领先指标没有方向，使用滞后指标
-
+            # ========== 方向冲突检测 ==========
+            # 检查滞后指标是否与领先指标方向冲突
+            lagging_direction = 0
             if lagging_indicators_score > 0.1:
-
-                direction = 1
-
+                lagging_direction = 1
             elif lagging_indicators_score < -0.1:
+                lagging_direction = -1
 
-                direction = -1
-
+            # 如果存在方向冲突，降低信号强度但不反转方向
+            if lagging_direction != 0 and lagging_direction != leading_direction:
+                # 方向冲突：降低信号强度
+                conflict_penalty = 0.3  # 冲突惩罚系数
+                final_score *= (1.0 - conflict_penalty)
+                logger.warning(
+                    f"⚠️ [趋势信号方向冲突] 领先指标方向={leading_direction}({'BUY' if leading_direction == 1 else 'SELL'}), "
+                    f"滞后指标方向={lagging_direction}({'BUY' if lagging_direction == 1 else 'SELL'}), "
+                    f"领先得分={leading_indicators_score:.3f}, 滞后得分={lagging_indicators_score:.3f}, "
+                    f"综合得分降低{conflict_penalty * 100:.0f}%至{final_score:.3f}")
             else:
-
+                logger.debug(f"🔍 [趋势信号] 使用领先指标方向: leading_direction={leading_direction}, "
+                             f"leading_score={leading_indicators_score:.3f}, lagging_score={lagging_indicators_score:.3f}, "
+                             f"方向一致={'是' if lagging_direction == leading_direction else '否'}")
+        else:
+            # 如果领先指标没有方向，使用滞后指标
+            if lagging_indicators_score > 0.1:
+                direction = 1
+                logger.debug(
+                    f"🔍 [趋势信号] 领先指标无方向，使用滞后指标: lagging_score={lagging_indicators_score:.3f} → 看涨(1)")
+            elif lagging_indicators_score < -0.1:
+                direction = -1
+                logger.debug(
+                    f"🔍 [趋势信号] 领先指标无方向，使用滞后指标: lagging_score={lagging_indicators_score:.3f} → 看跌(-1)")
+            else:
                 direction = 0
+                logger.debug(f"🔍 [趋势信号] 领先和滞后指标都无明确方向")
 
         # 如果综合评分不足，返回None
 
         # 对于趋势启动信号，已经提前返回了，这里只处理普通趋势信号
-        if abs(final_score) < 0.25 or direction == 0:  # 进一步降低阈值，从0.3降到0.25
+        if abs(final_score) < 0.25 or direction == 0:
+            logger.debug(f"⏸️ [趋势信号] 评分不足或方向不明: final_score={final_score:.3f}, direction={direction}")
             return None
+
+        # 添加详细的方向验证日志
+        signal_direction_str = 'BUY' if direction == 1 else 'SELL'
+        lagging_dir_str = 'BUY' if lagging_indicators_score > 0.1 else (
+            'SELL' if lagging_indicators_score < -0.1 else 'NEUTRAL')
+        has_conflict = (leading_direction != 0 and lagging_indicators_score != 0 and
+                        ((leading_direction == 1 and lagging_indicators_score < -0.1) or
+                         (leading_direction == -1 and lagging_indicators_score > 0.1)))
+
+        logger.info(f"🔍 [趋势信号方向诊断] "
+                    f"最终方向={signal_direction_str}({direction}), "
+                    f"领先指标方向={leading_direction}({'BUY' if leading_direction == 1 else 'SELL' if leading_direction == -1 else 'NEUTRAL'}), "
+                    f"滞后指标方向={lagging_dir_str}, "
+                    f"领先指标得分={leading_indicators_score:.3f}, "
+                    f"滞后指标得分={lagging_indicators_score:.3f}, "
+                    f"综合得分={final_score:.3f}, "
+                    f"方向冲突={'是' if has_conflict else '否'}, "
+                    f"当前价格={current_price:.2f}")
 
         # ========== 4. 成交量确认（额外加成）==========
 
@@ -9204,19 +10637,20 @@ class ProfessionalSignalGenerator:
         # 返回信号
 
         if signal_score > 0 and direction != 0:
+            signal_direction_str = 'BUY' if direction == 1 else 'SELL'
 
-            if int(current_time) % 60 == 0:
-                logger.info(f"📊 优化趋势信号: 方向={'BUY' if direction == 1 else 'SELL'}, "
-
-                            f"强度={signal_score:.3f}, 领先指标得分={leading_indicators_score:.3f}, "
-
-                            f"滞后指标得分={lagging_indicators_score:.3f} "
-
-                            f"(需要≥{ProfessionalComplexConfig.SIGNAL_GENERATION['MIN_STRENGTH']})")
+            # 添加详细的信号生成日志
+            logger.info(f"📊 [趋势信号生成] 方向={signal_direction_str}({direction}), "
+                        f"强度={signal_score:.3f}, "
+                        f"领先指标得分={leading_indicators_score:.3f}(方向={leading_direction}), "
+                        f"滞后指标得分={lagging_indicators_score:.3f}, "
+                        f"综合得分={final_score:.3f}, "
+                        f"当前价格={current_price:.2f}, "
+                        f"需要≥{ProfessionalComplexConfig.SIGNAL_GENERATION['MIN_STRENGTH']}")
 
             return {
 
-                'direction': 'BUY' if direction == 1 else 'SELL',
+                'direction': signal_direction_str,
 
                 'strength': min(1.0, signal_score),
 
@@ -9228,7 +10662,10 @@ class ProfessionalSignalGenerator:
 
                 'lagging_score': lagging_indicators_score,
 
-                'signal_type': 'OPTIMIZED_TREND'  # 标记为优化后的趋势信号
+                'signal_type': 'OPTIMIZED_TREND',  # 标记为优化后的趋势信号
+
+                'leading_direction': leading_direction,  # 添加领先指标方向用于调试
+                'final_score': final_score  # 添加综合得分用于调试
 
             }
 
@@ -9467,18 +10904,24 @@ class ProfessionalSignalGenerator:
             if bullish_oscillators > bearish_oscillators:
 
                 direction = 1
+                logger.debug(f"🔍 [震荡信号] 看涨震荡指标更多: 看涨={bullish_oscillators}, 看跌={bearish_oscillators}, "
+                             f"RSI={rsi_14:.2f}, Stoch_K={stoch_k:.2f}")
 
             elif bearish_oscillators > bullish_oscillators:
 
                 direction = -1
+                logger.debug(f"🔍 [震荡信号] 看跌震荡指标更多: 看涨={bullish_oscillators}, 看跌={bearish_oscillators}, "
+                             f"RSI={rsi_14:.2f}, Stoch_K={stoch_k:.2f}")
 
             elif rsi_14 < 50:
 
                 direction = 1
+                logger.debug(f"🔍 [震荡信号] 震荡指标相等，根据RSI判断: RSI={rsi_14:.2f} < 50 → 看涨")
 
             else:
 
                 direction = -1
+                logger.debug(f"🔍 [震荡信号] 震荡指标相等，根据RSI判断: RSI={rsi_14:.2f} >= 50 → 看跌")
 
         if direction != 0:
 
@@ -9607,21 +11050,44 @@ class ProfessionalSignalGenerator:
             if (rsi_14 < 25 or rsi_14 > 75) or (stoch_k < 20 or stoch_k > 80):
                 signal_score *= 1.08  # 极端区域，增强8%
 
-            return {
-
+            # ========== 增强反转信号验证（多周期确认、结构确认、形态确认） ==========
+            reversal_signal = {
                 'direction': 'BUY' if direction == 1 else 'SELL',
-
                 'strength': min(1.0, signal_score),
-
                 'entry_price': current_price,
-
                 'spread': spread,
-
-                'fusion_confidence': min(1.0, signal_score * 0.9),  # 添加融合置信度
-
-                'consistency': min(1.0, total_confirmations / 5.0) if total_confirmations > 0 else 0.5  # 添加一致性评分
-
+                'fusion_confidence': min(1.0, signal_score * 0.9),
+                'consistency': min(1.0, total_confirmations / 5.0) if total_confirmations > 0 else 0.5,
+                'reversal_signal': True  # 标记为反转信号
             }
+
+            # 执行增强验证
+            logger.debug(f"🔍 [反转信号验证] 开始验证: 方向={direction}, 强度={signal_score:.2f}, "
+                         f"当前价格={current_price:.2f}")
+            validation_result = self._validate_reversal_signal(reversal_signal, indicators, current_price)
+
+            # 如果验证失败，拒绝信号
+            if not validation_result['valid']:
+                logger.warning(f"⏸️ [反转信号验证] 验证失败: 方向={direction}, "
+                               f"验证分数={validation_result.get('score', 0):.1f}/{validation_result.get('max_score', 10):.1f}, "
+                               f"原因={validation_result.get('reason', 'N/A')}")
+                return None
+            else:
+                logger.info(f"✅ [反转信号验证] 验证通过: 方向={direction}, "
+                            f"验证分数={validation_result.get('score', 0):.1f}/{validation_result.get('max_score', 10):.1f}, "
+                            f"详情={', '.join(validation_result.get('details', []))}")
+
+            # 根据验证结果调整信号强度
+            if validation_result['confidence_boost'] > 0:
+                reversal_signal['strength'] = min(1.0,
+                                                  reversal_signal['strength'] + validation_result['confidence_boost'])
+                reversal_signal['fusion_confidence'] = min(1.0,
+                                                           reversal_signal['fusion_confidence'] + validation_result[
+                                                               'confidence_boost'] * 0.5)
+
+            reversal_signal['reversal_validation'] = validation_result
+
+            return reversal_signal
 
         return None
 
@@ -9847,6 +11313,129 @@ class ProfessionalSignalGenerator:
             }
 
         return None
+
+
+class OrderRecord:
+    """订单记录类 - 记录每笔订单的完整信息"""
+
+    def __init__(self, ticket: int, signal: Dict, entry_price: float, lot_size: float):
+        self.ticket = ticket
+        self.entry_time = datetime.now()
+        self.entry_price = entry_price
+        self.lot_size = lot_size
+        self.direction = signal.get('direction', 'UNKNOWN')
+
+        # 开仓原因
+        self.open_reason = {
+            'signal_strength': signal.get('strength', 0),
+            'market_state': signal.get('market_state', 'UNKNOWN'),
+            'signal_type': signal.get('signal_type', 'UNKNOWN'),
+            'indicators': signal.get('indicators', {}),
+            'reason_text': signal.get('reason', '')
+        }
+
+        # 价格信息
+        self.stop_loss = signal.get('stop_loss', 0)
+        self.take_profit = signal.get('take_profit', 0)
+
+        # 盈亏跟踪
+        self.max_floating_profit = 0.0  # 最大浮盈（USD）
+        self.max_floating_loss = 0.0  # 最大浮亏（USD）
+        self.max_drawdown = 0.0  # 最大回撤（USD）
+        self.max_drawdown_pct = 0.0  # 最大回撤百分比
+
+        # 当前状态
+        self.current_floating_profit = 0.0
+        self.current_floating_loss = 0.0
+
+        # 平仓信息
+        self.close_time = None
+        self.close_price = 0.0
+        self.final_profit = 0.0
+        self.final_profit_pct = 0.0
+        self.close_reason = ''
+        self.hold_duration = 0.0  # 持仓时长（秒）
+
+        # 是否已平仓
+        self.is_closed = False
+
+    def update_floating_pnl(self, current_price: float, point_value: float = 1.0):
+        """更新浮盈浮亏"""
+        if self.is_closed:
+            return
+
+        # 计算价格差（点数）
+        if self.direction == 'BUY':
+            price_diff = current_price - self.entry_price
+        else:  # SELL
+            price_diff = self.entry_price - current_price
+
+        # 计算浮盈浮亏（USD）
+        # 黄金：每点价值 = point_value，每手100盎司
+        # 盈亏 = 价格差（美元） × 手数 × 100（盎司/手）
+        floating_profit_usd = price_diff * self.lot_size * 100
+
+        if floating_profit_usd > 0:
+            self.current_floating_profit = floating_profit_usd
+            self.current_floating_loss = 0.0
+            # 更新最大浮盈
+            if floating_profit_usd > self.max_floating_profit:
+                self.max_floating_profit = floating_profit_usd
+        else:
+            self.current_floating_profit = 0.0
+            self.current_floating_loss = abs(floating_profit_usd)
+            # 更新最大浮亏
+            if abs(floating_profit_usd) > self.max_floating_loss:
+                self.max_floating_loss = abs(floating_profit_usd)
+
+        # 计算最大回撤（从峰值盈利到当前的回撤）
+        if self.max_floating_profit > 0:
+            current_drawdown = self.max_floating_profit - floating_profit_usd
+            if current_drawdown > self.max_drawdown:
+                self.max_drawdown = current_drawdown
+                self.max_drawdown_pct = (
+                            current_drawdown / self.max_floating_profit * 100) if self.max_floating_profit > 0 else 0
+
+    def close_order(self, close_price: float, final_profit: float, close_reason: str = ''):
+        """记录平仓信息"""
+        self.is_closed = True
+        self.close_time = datetime.now()
+        self.close_price = close_price
+        self.final_profit = final_profit
+        self.close_reason = close_reason
+
+        # 计算持仓时长
+        if self.close_time and self.entry_time:
+            self.hold_duration = (self.close_time - self.entry_time).total_seconds()
+
+        # 计算最终盈利百分比
+        price_diff = abs(close_price - self.entry_price)
+        if self.entry_price > 0:
+            self.final_profit_pct = (price_diff / self.entry_price) * 100
+
+    def to_dict(self) -> Dict:
+        """转换为字典格式"""
+        return {
+            'ticket': self.ticket,
+            'entry_time': self.entry_time.isoformat() if self.entry_time else None,
+            'close_time': self.close_time.isoformat() if self.close_time else None,
+            'entry_price': self.entry_price,
+            'close_price': self.close_price,
+            'direction': self.direction,
+            'lot_size': self.lot_size,
+            'stop_loss': self.stop_loss,
+            'take_profit': self.take_profit,
+            'open_reason': self.open_reason,
+            'close_reason': self.close_reason,
+            'max_floating_profit': self.max_floating_profit,
+            'max_floating_loss': self.max_floating_loss,
+            'max_drawdown': self.max_drawdown,
+            'max_drawdown_pct': self.max_drawdown_pct,
+            'final_profit': self.final_profit,
+            'final_profit_pct': self.final_profit_pct,
+            'hold_duration': self.hold_duration,
+            'is_closed': self.is_closed
+        }
 
 
 class ComplexRiskManager:
@@ -10534,7 +12123,7 @@ class ComplexRiskManager:
             if tick_value > 0 and point > 0:
                 min_tp_distance_usd = min_profit_to_cover_cost
                 min_tp_distance_price = min_tp_distance_usd / (tick_value / point) if (
-                                                                                                  tick_value / point) > 0 else min_tp_distance_usd
+                                                                                              tick_value / point) > 0 else min_tp_distance_usd
             else:
                 # 如果无法计算，使用保守估计（假设1点=1美元）
                 min_tp_distance_price = min_profit_to_cover_cost
@@ -10660,7 +12249,7 @@ class ComplexRiskManager:
 
                 if tick_value > 0 and point > 0:
                     min_tp_distance_price = min_profit_to_cover_cost / (tick_value / point) if (
-                                                                                                           tick_value / point) > 0 else min_profit_to_cover_cost
+                                                                                                       tick_value / point) > 0 else min_profit_to_cover_cost
                 else:
                     min_tp_distance_price = min_profit_to_cover_cost
 
@@ -11006,6 +12595,10 @@ class ProfessionalPositionManager:
         self.position_signal_features = {}  # {ticket: np.ndarray}
 
         self.position_signal_info = {}  # {ticket: Dict} 存储信号的完整信息（包括RL挖掘的模式）
+
+        # 订单记录系统
+        self.order_records = {}  # {ticket: OrderRecord} 记录所有订单
+        self.closed_order_records = []  # 已平仓订单记录列表
 
     @staticmethod
     def normalize_price(price: float, digits: int) -> float:
@@ -11855,7 +13448,7 @@ class ProfessionalPositionManager:
                 # 75美元盈利 = 75个点 × 1美元/点 = 75个点
                 # 75个点 = 75 × 0.01美元 = 0.75美元的价格距离
                 min_tp_price_diff_usd = min_profit_usd / (tick_value / point) if (
-                                                                                             tick_value / point) > 0 else min_profit_usd
+                                                                                         tick_value / point) > 0 else min_profit_usd
             else:
                 # 如果无法计算，使用保守估计
                 min_tp_price_diff_usd = min_profit_usd
@@ -12376,6 +13969,14 @@ class ProfessionalPositionManager:
                 return None
 
             logger.info(f"✅ 开仓成功: {signal['direction']} {lot_size}手 @ {entry_price:.2f} (订单号: {order_ticket})")
+
+            # 创建订单记录
+            signal_with_sl_tp = signal.copy()
+            signal_with_sl_tp['stop_loss'] = sl_price
+            signal_with_sl_tp['take_profit'] = tp_price
+            order_record = OrderRecord(order_ticket, signal_with_sl_tp, entry_price, lot_size)
+            self.order_records[order_ticket] = order_record
+            logger.info(f"📝 已创建订单记录: Ticket={order_ticket}")
 
             # 更新最近开仓的时间和价格
 
@@ -14021,6 +15622,12 @@ class ProfessionalPositionManager:
             for ticket, pos in positions.items():
 
                 try:
+                    # 更新订单记录的浮盈浮亏
+                    if ticket in self.order_records:
+                        order_record = self.order_records[ticket]
+                        point_value = ProfessionalComplexConfig.POINT_VALUE
+                        order_record.update_floating_pnl(current_price, point_value)
+
                     # 0. 检查并补充止盈止损（如果缺失）
                     self._ensure_sl_tp_set(ticket, pos)
 
@@ -14617,6 +16224,58 @@ class ProfessionalPositionManager:
 
                 logger.info(f"✅ 平仓成功: {volume}手 @ {close_price:.2f} (ticket: {ticket})")
 
+                # 记录订单信息
+                if ticket in self.order_records:
+                    order_record = self.order_records[ticket]
+                    # 计算最终盈亏
+                    entry_price = position.price_open
+                    if position_type == 'BUY':
+                        profit_usd = (close_price - entry_price) * volume * 100
+                    else:
+                        profit_usd = (entry_price - close_price) * volume * 100
+
+                    # 扣除手续费
+                    commission = ProfessionalComplexConfig.COMMISSION_PER_LOT * volume
+                    final_profit = profit_usd - commission
+
+                    order_record.close_order(close_price, final_profit, f"完全平仓_{position_type}")
+                    self.closed_order_records.append(order_record.to_dict())
+                    logger.info(f"📝 订单记录已更新: Ticket={ticket}, 最终盈亏=${final_profit:.2f}")
+
+                    # ========== 记录实盘交易结果用于ML在线学习 ==========
+                    try:
+                        # 获取信号特征（如果存在）
+                        signal = order_record.signal if hasattr(order_record, 'signal') else {}
+                        if signal and hasattr(self, 'strategy') and hasattr(self.strategy, 'signal_generator'):
+                            ml_evaluator = self.strategy.signal_generator.ml_evaluator
+                            if ml_evaluator and ml_evaluator.is_trained:
+                                # 提取特征（需要重新计算，因为信号可能已过期）
+                                indicators = self.strategy.data_engine.calculate_complex_indicators() if hasattr(
+                                    self.strategy, 'data_engine') else {}
+                                market_state, state_confidence = self.strategy.market_analyzer.analyze_complex_market_state() if hasattr(
+                                    self.strategy, 'market_analyzer') else ('UNKNOWN', 0.5)
+
+                                signal_features = ml_evaluator.extract_features(
+                                    signal, indicators, market_state, state_confidence,
+                                    self.strategy.data_engine if hasattr(self.strategy, 'data_engine') else None
+                                )
+
+                                # 判断是否成功（最终盈利>0）
+                                is_success = final_profit > 0
+
+                                # 记录到ML评估器
+                                ml_evaluator.record_real_trading_result(
+                                    signal_features, signal, final_profit, is_success
+                                )
+
+                                logger.debug(
+                                    f"📊 已记录实盘交易结果用于ML学习: Ticket={ticket}, 成功={is_success}, 盈亏=${final_profit:.2f}")
+                    except Exception as e:
+                        logger.debug(f"记录实盘交易结果异常（不影响交易）: {str(e)}")
+
+                    # 从活跃记录中移除
+                    del self.order_records[ticket]
+
                 # 清理相关记录
 
                 if ticket in self.position_tp_targets:
@@ -14636,11 +16295,12 @@ class ProfessionalPositionManager:
                 if ticket in self.position_peak_profit:
                     del self.position_peak_profit[ticket]
 
-                # 记录信号结果用于ML训练（如果存在信号特征）
+                # 记录信号结果用于ML训练（如果存在信号特征）- 增强版在线学习
 
                 if hasattr(self, 'position_signal_features') and ticket in self.position_signal_features:
 
                     signal_features = self.position_signal_features[ticket]
+                    signal_info = self.position_signal_info.get(ticket, {})
 
                     entry_price = position.price_open
 
@@ -14650,7 +16310,7 @@ class ProfessionalPositionManager:
 
                     hold_duration = time.time() - entry_time if entry_time > 0 else 0
 
-                    # 计算盈亏
+                    # 计算盈亏（使用已计算的final_profit）
 
                     if position_type == 'BUY':
 
@@ -14664,25 +16324,23 @@ class ProfessionalPositionManager:
 
                         was_profitable = close_price < entry_price
 
-                    # 记录到ML评估器（如果可用）
-
-                    # 注意：需要通过策略主类访问signal_generator
-
-                    # 这里先记录，策略主类会定期处理
-
+                    # 记录到ML评估器（如果可用）- 使用增强的在线学习方法
                     if hasattr(self, 'signal_generator') and hasattr(self.signal_generator, 'ml_evaluator'):
-
                         try:
+                            ml_evaluator = self.signal_generator.ml_evaluator
+                            signal_info = self.position_signal_info.get(ticket, {})
 
-                            self.signal_generator.ml_evaluator.record_signal_outcome(
+                            # 使用已计算的final_profit（已扣除手续费）
+                            is_success = final_profit > 0
 
-                                signal_features, was_profitable, profit_usd, hold_duration
-
+                            # 使用新的在线学习方法
+                            ml_evaluator.record_real_trading_result(
+                                signal_features, signal_info, final_profit, is_success
                             )
 
+                            logger.debug(f"📊 ML在线学习: Ticket={ticket}, 成功={is_success}, 盈亏=${final_profit:.2f}")
                         except Exception as e:
-
-                            logger.warning(f"记录信号结果异常: {str(e)}")
+                            logger.warning(f"记录ML学习数据异常: {str(e)}")
 
                     # 更新RL质量评估器（如果可用）
 
@@ -15089,6 +16747,38 @@ class ProfessionalComplexStrategy:
         self.last_factor_mining_time = 0  # 因子挖掘时间戳
         self.factor_mining_interval = 300  # 因子挖掘间隔（5分钟）
 
+        # 检查并预训练模型
+        self._check_and_pretrain_model()
+
+    def _check_and_pretrain_model(self):
+        """检查模型是否存在，如果不存在则进行预训练"""
+        try:
+            # 检查ML评估器是否有训练好的模型
+            if hasattr(self.signal_generator, 'ml_evaluator'):
+                ml_evaluator = self.signal_generator.ml_evaluator
+                if not ml_evaluator.is_trained:
+                    logger.info("📊 未找到已训练模型，开始从历史数据预训练...")
+                    symbol = self.data_engine.symbol
+                    if symbol:
+                        # 尝试预训练（使用30天历史数据）
+                        success = ml_evaluator.pretrain_from_history(
+                            self.data_engine,
+                            self.market_analyzer,
+                            symbol,
+                            days=30,
+                            min_samples=50  # 降低最小样本要求，以便更快完成预训练
+                        )
+                        if success:
+                            logger.info("✅ 模型预训练完成")
+                        else:
+                            logger.warning("⚠️ 模型预训练失败，将使用默认评估")
+                    else:
+                        logger.warning("⚠️ 无法获取交易品种，跳过预训练")
+                else:
+                    logger.info("✅ 已加载训练好的模型")
+        except Exception as e:
+            logger.warning(f"⚠️ 检查模型时异常: {str(e)}")
+
     def run_strategy(self):
 
         """运行策略主循环"""
@@ -15445,13 +17135,8 @@ class ProfessionalComplexStrategy:
                                         # 保存RL模型
 
                                         try:
-
-                                            rl_evaluator.agent.save_model("rl_quality_evaluator_model.pth")
-
-                                            logger.info(f"✅ RL质量评估器模型已保存")
-
+                                            rl_evaluator.save_checkpoint()
                                         except Exception as e:
-
                                             logger.warning(f"⚠️ 保存RL模型失败: {str(e)}")
 
                                     # RL信号挖掘器训练（定期批量训练）
@@ -15485,13 +17170,8 @@ class ProfessionalComplexStrategy:
                                                     f"📊 RL挖掘批量训练完成: 平均损失={avg_loss:.4f}, 训练批次={train_count}")
 
                                             try:
-
-                                                rl_miner.agent.save_model("rl_signal_miner_model.pth")
-
-                                                logger.info(f"✅ RL信号挖掘器模型已保存")
-
+                                                rl_miner.save_checkpoint()
                                             except Exception as e:
-
                                                 logger.warning(f"⚠️ 保存RL挖掘模型失败: {str(e)}")
 
                                         # 输出挖掘到的模式统计
@@ -15551,6 +17231,9 @@ class ProfessionalComplexStrategy:
 
         self.running = False
 
+        # 生成综合统计报告
+        self._generate_final_report()
+
         # 打印最终统计
 
         positions = self.position_manager.get_open_positions()
@@ -15558,6 +17241,625 @@ class ProfessionalComplexStrategy:
         logger.info(f"当前持仓数: {len(positions)}")
 
         logger.info(f"今日交易数: {self.position_manager.daily_trades}")
+
+    def _generate_final_report(self):
+        """生成本次运行的综合统计报告"""
+        try:
+            logger.info("=" * 80)
+            logger.info("📊 本次运行综合统计报告")
+            logger.info("=" * 80)
+
+            # 获取所有已平仓订单记录
+            closed_orders = self.position_manager.closed_order_records
+            active_orders = list(self.position_manager.order_records.values())
+
+            total_orders = len(closed_orders) + len(active_orders)
+
+            if total_orders == 0:
+                logger.info("⚠️ 本次运行没有完成任何订单")
+                logger.info("=" * 80)
+                return
+
+            logger.info(f"📈 订单统计:")
+            logger.info(f"   总订单数: {total_orders}")
+            logger.info(f"   已平仓订单: {len(closed_orders)}")
+            logger.info(f"   当前持仓: {len(active_orders)}")
+
+            if len(closed_orders) > 0:
+                # 计算统计数据
+                profitable_orders = [o for o in closed_orders if o.get('final_profit', 0) > 0]
+                losing_orders = [o for o in closed_orders if o.get('final_profit', 0) <= 0]
+
+                total_profit = sum(o.get('final_profit', 0) for o in closed_orders)
+                total_profit_pct = sum(o.get('final_profit_pct', 0) for o in closed_orders)
+                avg_profit = total_profit / len(closed_orders) if len(closed_orders) > 0 else 0
+
+                win_rate = len(profitable_orders) / len(closed_orders) * 100 if len(closed_orders) > 0 else 0
+
+                avg_win = sum(o.get('final_profit', 0) for o in profitable_orders) / len(profitable_orders) if len(
+                    profitable_orders) > 0 else 0
+                avg_loss = sum(o.get('final_profit', 0) for o in losing_orders) / len(losing_orders) if len(
+                    losing_orders) > 0 else 0
+
+                max_profit = max((o.get('final_profit', 0) for o in closed_orders), default=0)
+                max_loss = min((o.get('final_profit', 0) for o in closed_orders), default=0)
+
+                # 最大浮盈和浮亏
+                max_floating_profit = max((o.get('max_floating_profit', 0) for o in closed_orders), default=0)
+                max_floating_loss = max((o.get('max_floating_loss', 0) for o in closed_orders), default=0)
+
+                # 最大回撤
+                max_drawdown = max((o.get('max_drawdown', 0) for o in closed_orders), default=0)
+                max_drawdown_pct = max((o.get('max_drawdown_pct', 0) for o in closed_orders), default=0)
+
+                # 平均持仓时长
+                avg_hold_duration = sum(o.get('hold_duration', 0) for o in closed_orders) / len(closed_orders) if len(
+                    closed_orders) > 0 else 0
+
+                logger.info(f"\n💰 盈亏统计:")
+                logger.info(f"   总盈亏: ${total_profit:.2f} ({total_profit_pct:.2f}%)")
+                logger.info(f"   平均盈亏: ${avg_profit:.2f}")
+                logger.info(f"   胜率: {win_rate:.1f}% ({len(profitable_orders)}/{len(closed_orders)})")
+                logger.info(f"   平均盈利: ${avg_win:.2f}")
+                logger.info(f"   平均亏损: ${avg_loss:.2f}")
+                logger.info(f"   最大盈利: ${max_profit:.2f}")
+                logger.info(f"   最大亏损: ${max_loss:.2f}")
+
+                logger.info(f"\n📊 风险指标:")
+                logger.info(f"   最大浮盈: ${max_floating_profit:.2f}")
+                logger.info(f"   最大浮亏: ${max_floating_loss:.2f}")
+                logger.info(f"   最大回撤: ${max_drawdown:.2f} ({max_drawdown_pct:.2f}%)")
+                logger.info(f"   平均持仓时长: {avg_hold_duration:.0f}秒 ({avg_hold_duration / 60:.1f}分钟)")
+
+                # 按方向统计
+                buy_orders = [o for o in closed_orders if o.get('direction') == 'BUY']
+                sell_orders = [o for o in closed_orders if o.get('direction') == 'SELL']
+
+                if len(buy_orders) > 0:
+                    buy_profit = sum(o.get('final_profit', 0) for o in buy_orders)
+                    buy_win_rate = len([o for o in buy_orders if o.get('final_profit', 0) > 0]) / len(buy_orders) * 100
+                    logger.info(f"\n📈 做多订单:")
+                    logger.info(f"   数量: {len(buy_orders)}")
+                    logger.info(f"   总盈亏: ${buy_profit:.2f}")
+                    logger.info(f"   胜率: {buy_win_rate:.1f}%")
+
+                if len(sell_orders) > 0:
+                    sell_profit = sum(o.get('final_profit', 0) for o in sell_orders)
+                    sell_win_rate = len([o for o in sell_orders if o.get('final_profit', 0) > 0]) / len(
+                        sell_orders) * 100
+                    logger.info(f"\n📉 做空订单:")
+                    logger.info(f"   数量: {len(sell_orders)}")
+                    logger.info(f"   总盈亏: ${sell_profit:.2f}")
+                    logger.info(f"   胜率: {sell_win_rate:.1f}%")
+
+                # 保存详细报告到文件
+                report_file = f"trading_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                report_data = {
+                    'report_time': datetime.now().isoformat(),
+                    'summary': {
+                        'total_orders': total_orders,
+                        'closed_orders': len(closed_orders),
+                        'active_orders': len(active_orders),
+                        'total_profit': total_profit,
+                        'total_profit_pct': total_profit_pct,
+                        'win_rate': win_rate,
+                        'avg_profit': avg_profit,
+                        'avg_win': avg_win,
+                        'avg_loss': avg_loss,
+                        'max_profit': max_profit,
+                        'max_loss': max_loss,
+                        'max_floating_profit': max_floating_profit,
+                        'max_floating_loss': max_floating_loss,
+                        'max_drawdown': max_drawdown,
+                        'max_drawdown_pct': max_drawdown_pct,
+                        'avg_hold_duration': avg_hold_duration
+                    },
+                    'closed_orders': closed_orders,
+                    'active_orders': [o.to_dict() for o in active_orders]
+                }
+
+                with open(report_file, 'w', encoding='utf-8') as f:
+                    json.dump(report_data, f, ensure_ascii=False, indent=2)
+
+                logger.info(f"\n💾 详细报告已保存到: {report_file}")
+
+            logger.info("=" * 80)
+
+        except Exception as e:
+            logger.error(f"❌ 生成统计报告异常: {str(e)}")
+            traceback.print_exc()
+
+
+# ========== 回测模块 ==========
+
+class BacktestEngine:
+    """
+    专业回测引擎
+    支持Tick级别回测，考虑交易成本、滑点、订单执行延迟等
+    """
+
+    def __init__(self, initial_balance: float = 10000.0, commission_per_lot: float = 50.0,
+                 slippage_points: int = 2, point_value: float = 1.0):
+        self.initial_balance = initial_balance
+        self.commission_per_lot = commission_per_lot
+        self.slippage_points = slippage_points
+        self.point_value = point_value
+
+        # 回测状态
+        self.balance = initial_balance
+        self.equity = initial_balance
+        self.positions = {}
+        self.closed_trades = []
+        self.trade_history = []
+
+        # 统计指标
+        self.max_drawdown = 0.0
+        self.peak_equity = initial_balance
+        self.peak_time = None
+
+        # 性能指标
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
+        self.total_profit = 0.0
+        self.total_loss = 0.0
+        self.max_profit = 0.0
+        self.max_loss = 0.0
+
+    def reset(self):
+        """重置回测引擎状态"""
+        self.balance = self.initial_balance
+        self.equity = self.initial_balance
+        self.positions = {}
+        self.closed_trades = []
+        self.trade_history = []
+        self.max_drawdown = 0.0
+        self.peak_equity = self.initial_balance
+        self.peak_time = None
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
+        self.total_profit = 0.0
+        self.total_loss = 0.0
+        self.max_profit = 0.0
+        self.max_loss = 0.0
+
+    def open_position(self, ticket: int, direction: str, entry_price: float,
+                      lot_size: float, stop_loss: float, take_profit: float,
+                      timestamp: datetime, signal: Dict = None) -> bool:
+        """开仓"""
+        required_margin = lot_size * 1000
+        if self.equity < required_margin:
+            return False
+
+        # 应用滑点
+        if direction == 'BUY':
+            actual_entry = entry_price + self.slippage_points * 0.01
+        else:
+            actual_entry = entry_price - self.slippage_points * 0.01
+
+        commission = self.commission_per_lot * lot_size
+
+        position = {
+            'ticket': ticket,
+            'direction': direction,
+            'entry_price': actual_entry,
+            'lot_size': lot_size,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'open_time': timestamp,
+            'commission': commission,
+            'signal': signal or {}
+        }
+
+        self.positions[ticket] = position
+        self.balance -= commission
+        self.equity = self.balance
+
+        return True
+
+    def close_position(self, ticket: int, close_price: float, timestamp: datetime,
+                       reason: str = 'MANUAL') -> Optional[Dict]:
+        """平仓"""
+        if ticket not in self.positions:
+            return None
+
+        position = self.positions[ticket]
+
+        # 应用滑点
+        if position['direction'] == 'BUY':
+            actual_close = close_price - self.slippage_points * 0.01
+        else:
+            actual_close = close_price + self.slippage_points * 0.01
+
+        # 计算盈亏
+        if position['direction'] == 'BUY':
+            price_diff = actual_close - position['entry_price']
+        else:
+            price_diff = position['entry_price'] - actual_close
+
+        pnl = price_diff * position['lot_size'] * 100 * self.point_value
+        total_commission = position['commission'] * 2
+        net_pnl = pnl - total_commission
+
+        hold_duration = (timestamp - position['open_time']).total_seconds()
+
+        trade_result = {
+            'ticket': ticket,
+            'direction': position['direction'],
+            'entry_price': position['entry_price'],
+            'exit_price': actual_close,
+            'lot_size': position['lot_size'],
+            'pnl': pnl,
+            'commission': total_commission,
+            'net_pnl': net_pnl,
+            'open_time': position['open_time'],
+            'close_time': timestamp,
+            'hold_duration': hold_duration,
+            'reason': reason,
+            'signal': position.get('signal', {})
+        }
+
+        self.balance += net_pnl
+        self.equity = self.balance
+
+        self.total_trades += 1
+        if net_pnl > 0:
+            self.winning_trades += 1
+            self.total_profit += net_pnl
+            self.max_profit = max(self.max_profit, net_pnl)
+        else:
+            self.losing_trades += 1
+            self.total_loss += abs(net_pnl)
+            self.max_loss = max(self.max_loss, abs(net_pnl))
+
+        self._update_drawdown(timestamp)
+
+        self.closed_trades.append(trade_result)
+        self.trade_history.append({
+            'time': timestamp,
+            'action': 'CLOSE',
+            'ticket': ticket,
+            'pnl': net_pnl,
+            'equity': self.equity
+        })
+
+        del self.positions[ticket]
+
+        return trade_result
+
+    def update_positions(self, current_price: float, timestamp: datetime) -> List[Dict]:
+        """更新持仓，检查止损止盈"""
+        closed_trades = []
+
+        for ticket, position in list(self.positions.items()):
+            if position['direction'] == 'BUY':
+                if current_price <= position['stop_loss']:
+                    trade = self.close_position(ticket, position['stop_loss'], timestamp, 'STOP_LOSS')
+                    if trade:
+                        closed_trades.append(trade)
+                elif current_price >= position['take_profit']:
+                    trade = self.close_position(ticket, position['take_profit'], timestamp, 'TAKE_PROFIT')
+                    if trade:
+                        closed_trades.append(trade)
+            else:
+                if current_price >= position['stop_loss']:
+                    trade = self.close_position(ticket, position['stop_loss'], timestamp, 'STOP_LOSS')
+                    if trade:
+                        closed_trades.append(trade)
+                elif current_price <= position['take_profit']:
+                    trade = self.close_position(ticket, position['take_profit'], timestamp, 'TAKE_PROFIT')
+                    if trade:
+                        closed_trades.append(trade)
+
+            self.equity = self.balance
+            self._update_drawdown(timestamp)
+
+        return closed_trades
+
+    def _update_drawdown(self, timestamp: datetime):
+        """更新回撤"""
+        if self.equity > self.peak_equity:
+            self.peak_equity = self.equity
+            self.peak_time = timestamp
+
+        drawdown = (self.peak_equity - self.equity) / self.peak_equity if self.peak_equity > 0 else 0
+
+        if drawdown > self.max_drawdown:
+            self.max_drawdown = drawdown
+
+    def get_performance_metrics(self) -> Dict[str, Any]:
+        """计算回测性能指标"""
+        if self.total_trades == 0:
+            return {
+                'total_trades': 0,
+                'win_rate': 0.0,
+                'profit_factor': 0.0,
+                'sharpe_ratio': 0.0,
+                'max_drawdown': self.max_drawdown,
+                'total_return': 0.0,
+                'final_balance': self.balance
+            }
+
+        win_rate = self.winning_trades / self.total_trades
+        profit_factor = self.total_profit / self.total_loss if self.total_loss > 0 else float('inf')
+        total_return = (self.balance - self.initial_balance) / self.initial_balance
+
+        returns = []
+        prev_equity = self.initial_balance
+        for trade in self.trade_history:
+            if trade['action'] == 'CLOSE':
+                returns.append((trade['equity'] - prev_equity) / prev_equity if prev_equity > 0 else 0)
+                prev_equity = trade['equity']
+
+        sharpe_ratio = 0.0
+        if len(returns) > 1:
+            mean_return = np.mean(returns)
+            std_return = np.std(returns)
+            sharpe_ratio = mean_return / std_return * np.sqrt(252) if std_return > 0 else 0
+
+        avg_win = self.total_profit / self.winning_trades if self.winning_trades > 0 else 0
+        avg_loss = self.total_loss / self.losing_trades if self.losing_trades > 0 else 0
+        expectancy = (win_rate * avg_win) - ((1 - win_rate) * avg_loss)
+
+        return {
+            'total_trades': self.total_trades,
+            'winning_trades': self.winning_trades,
+            'losing_trades': self.losing_trades,
+            'win_rate': win_rate,
+            'profit_factor': profit_factor,
+            'total_profit': self.total_profit,
+            'total_loss': self.total_loss,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss,
+            'max_profit': self.max_profit,
+            'max_loss': self.max_loss,
+            'expectancy': expectancy,
+            'sharpe_ratio': sharpe_ratio,
+            'max_drawdown': self.max_drawdown,
+            'total_return': total_return,
+            'final_balance': self.balance,
+            'initial_balance': self.initial_balance
+        }
+
+    def run_backtest_with_strategy(self, tick_data: pd.DataFrame, strategy: Any,
+                                   start_date: datetime, end_date: datetime) -> Dict[str, Any]:
+        """
+        使用实际策略运行回测
+
+        Args:
+            tick_data: Tick数据DataFrame
+            strategy: 策略实例
+            start_date: 开始日期
+            end_date: 结束日期
+
+        Returns:
+            Dict: 回测结果
+        """
+        self.reset()
+
+        mask = (tick_data['time'] >= start_date) & (tick_data['time'] <= end_date)
+        data = tick_data[mask].copy()
+
+        if len(data) == 0:
+            logger.warning("回测数据为空")
+            return self.get_performance_metrics()
+
+        logger.info(f"📊 开始回测: {start_date.date()} 到 {end_date.date()}, 共{len(data)}条Tick数据")
+
+        # 模拟数据引擎更新
+        ticket_counter = 1
+        last_signal_time: Optional[datetime] = None
+        signal_interval = 60  # 每60秒最多一个信号
+        current_price = 0.0  # 初始化变量
+        current_time = start_date  # 初始化变量
+
+        for idx, row in data.iterrows():
+            current_time = row['time']
+            current_price = (row['bid'] + row['ask']) / 2
+
+            # 构造tick记录并使用数据引擎的更新方法，保证缓冲区一致性
+            tick_record = {
+                'timestamp': current_time.timestamp() if hasattr(current_time, 'timestamp') else time.time(),
+                'datetime': current_time,
+                'bid': float(row['bid']),
+                'ask': float(row['ask']),
+                'last': float(row.get('last', row['bid'])),
+                'volume': int(row.get('volume', 0)),
+                'spread': (float(row['ask']) - float(row['bid'])) * 10000,
+                'mid_price': current_price
+            }
+            # 使用数据引擎的缓冲更新函数，保持高低点/成交量等缓冲同步
+            if hasattr(strategy.data_engine, '_update_data_buffers'):
+                strategy.data_engine._update_data_buffers(tick_record)
+            else:
+                # 退化处理（理论不应走到这里）
+                if hasattr(strategy.data_engine, 'tick_buffer'):
+                    strategy.data_engine.tick_buffer.append(tick_record)
+                    if len(strategy.data_engine.tick_buffer) > 1000:
+                        strategy.data_engine.tick_buffer.popleft()
+                if hasattr(strategy.data_engine, 'price_buffer'):
+                    strategy.data_engine.price_buffer.append(current_price)
+                    if len(strategy.data_engine.price_buffer) > 1000:
+                        strategy.data_engine.price_buffer.popleft()
+
+            # 更新持仓（检查止损止盈）
+            self.update_positions(current_price, current_time)
+
+            # 初始化数据引擎（如果未初始化）
+            if not hasattr(strategy.data_engine, 'initialized') or not strategy.data_engine.initialized:
+                if len(strategy.data_engine.price_buffer) >= ProfessionalComplexConfig.MIN_TICKS_FOR_ANALYSIS:
+                    strategy.data_engine.initialized = True
+
+            # 生成信号（每10个tick检查一次，且距离上次信号至少60秒）
+            if idx % 10 == 0 and len(strategy.data_engine.price_buffer) >= 100 and strategy.data_engine.initialized:
+                time_since_last_signal = (
+                            current_time - last_signal_time).total_seconds() if last_signal_time is not None else float(
+                    'inf')
+
+                if time_since_last_signal >= signal_interval:
+                    try:
+                        signal = strategy.signal_generator.generate_trading_signal()
+
+                        if signal and signal.get('strength', 0) >= ProfessionalComplexConfig.SIGNAL_GENERATION[
+                            'MIN_STRENGTH']:
+                            # 计算止损止盈
+                            entry_price = current_price
+
+                            # 获取市场状态
+                            market_state, _ = strategy.market_analyzer.analyze_complex_market_state()
+
+                            # 计算止损距离（点数）
+                            sl_distance = strategy.risk_manager.calculate_stop_loss_distance(signal, entry_price)
+
+                            if sl_distance > 0:
+                                # 计算止损价格
+                                if signal['direction'] == 'BUY':
+                                    sl_price = entry_price - sl_distance * 0.01
+                                else:
+                                    sl_price = entry_price + sl_distance * 0.01
+
+                                # 计算止盈（使用风险管理的止盈计算）
+                                tp_levels = strategy.risk_manager.calculate_take_profit_levels(signal, entry_price,
+                                                                                               sl_price)
+
+                                # 使用第一个止盈目标
+                                if tp_levels and len(tp_levels) > 0:
+                                    tp_price = tp_levels[0].get('price', entry_price * 1.01 if signal[
+                                                                                                   'direction'] == 'BUY' else entry_price * 0.99)
+                                else:
+                                    # 默认止盈：1.5倍止损距离
+                                    tp_distance = sl_distance * 1.5
+                                    if signal['direction'] == 'BUY':
+                                        tp_price = entry_price + tp_distance * 0.01
+                                    else:
+                                        tp_price = entry_price - tp_distance * 0.01
+
+                                # 计算仓位
+                                lot_size = strategy.risk_manager.calculate_position_size(
+                                    signal, entry_price, sl_price, tp_price
+                                )
+
+                                # 开仓
+                                if lot_size > 0 and self.open_position(
+                                        ticket_counter, signal['direction'], entry_price,
+                                        lot_size, sl_price, tp_price, current_time, signal
+                                ):
+                                    ticket_counter += 1
+                                    last_signal_time = current_time
+                                    logger.debug(
+                                        f"回测开仓: {signal['direction']} {lot_size:.2f}手 @ {entry_price:.2f}, SL={sl_price:.2f}, TP={tp_price:.2f}")
+                    except Exception as e:
+                        logger.debug(f"回测信号生成异常: {str(e)}")
+
+        # 在回测结束时平掉所有持仓
+        if len(data) > 0:
+            final_price = data.iloc[-1]['bid']
+            final_time = data.iloc[-1]['time']
+            for ticket in list(self.positions.keys()):
+                self.close_position(ticket, final_price, final_time, 'END_OF_BACKTEST')
+        else:
+            # 如果没有数据，使用最后一个价格
+            if 'current_price' in locals() and 'current_time' in locals():
+                final_price = current_price
+                final_time = current_time
+                for ticket in list(self.positions.keys()):
+                    self.close_position(ticket, final_price, final_time, 'END_OF_BACKTEST')
+
+        metrics = self.get_performance_metrics()
+        logger.info(f"✅ 回测完成: 总交易{metrics['total_trades']}笔, 胜率{metrics['win_rate']:.2%}, "
+                    f"总收益{metrics['total_return']:.2%}, 最大回撤{metrics['max_drawdown']:.2%}, "
+                    f"Sharpe比率={metrics['sharpe_ratio']:.2f}")
+
+        return metrics
+
+
+def run_backtest_before_strategy(strategy: ProfessionalComplexStrategy, symbol: str,
+                                 backtest_days: int = 30) -> bool:
+    """
+    在策略运行前执行回测
+
+    Args:
+        strategy: 策略实例
+        symbol: 交易品种
+        backtest_days: 回测天数
+
+    Returns:
+        bool: 是否继续运行策略
+    """
+    try:
+        logger.info("=" * 60)
+        logger.info("📊 开始回测验证")
+        logger.info("=" * 60)
+
+        # 获取历史数据
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=backtest_days)
+
+        logger.info(f"获取历史数据: {start_date.date()} 到 {end_date.date()}")
+
+        ticks = mt5.copy_ticks_range(symbol, start_date, end_date, mt5.COPY_TICKS_ALL)
+
+        if ticks is None or len(ticks) == 0:
+            logger.warning("⚠️ 无法获取Tick数据，跳过回测")
+            return True  # 继续运行策略
+
+        # 转换为DataFrame
+        df = pd.DataFrame(ticks)
+        df['time'] = pd.to_datetime(df['time'], unit='s')
+
+        if 'bid' not in df.columns or 'ask' not in df.columns:
+            logger.warning("⚠️ 数据格式不正确，跳过回测")
+            return True
+
+        logger.info(f"✅ 获取到 {len(df)} 条Tick数据")
+
+        # 创建回测引擎
+        engine = BacktestEngine(
+            initial_balance=10000.0,
+            commission_per_lot=ProfessionalComplexConfig.COMMISSION_PER_LOT,
+            slippage_points=2,
+            point_value=ProfessionalComplexConfig.POINT_VALUE
+        )
+
+        # 运行回测
+        results = engine.run_backtest_with_strategy(df, strategy, start_date, end_date)
+
+        # 显示结果
+        logger.info("\n" + "=" * 60)
+        logger.info("📊 回测结果汇总")
+        logger.info("=" * 60)
+        logger.info(f"总交易次数: {results['total_trades']}")
+        logger.info(f"盈利交易: {results['winning_trades']}")
+        logger.info(f"亏损交易: {results['losing_trades']}")
+        logger.info(f"胜率: {results['win_rate']:.2%}")
+        logger.info(f"盈亏比: {results['profit_factor']:.2f}")
+        logger.info(f"总收益: {results['total_return']:.2%}")
+        logger.info(f"最大回撤: {results['max_drawdown']:.2%}")
+        logger.info(f"Sharpe比率: {results['sharpe_ratio']:.2f}")
+        logger.info(f"期望值: ${results['expectancy']:.2f}")
+        logger.info(f"最终余额: ${results['final_balance']:.2f}")
+        logger.info("=" * 60)
+
+        # 询问是否继续
+        if results['total_trades'] == 0:
+            logger.warning("⚠️ 回测期间未产生任何交易，策略可能过于保守")
+            response = input("\n是否继续运行策略? (y/n, 默认y): ").strip().lower()
+            return response != 'n'
+
+        if results['total_return'] < -0.1:  # 亏损超过10%
+            logger.warning("⚠️ 回测显示策略亏损超过10%，建议检查策略参数")
+            response = input("\n是否继续运行策略? (y/n, 默认y): ").strip().lower()
+            return response != 'n'
+
+        logger.info("✅ 回测结果良好，准备启动策略")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ 回测过程异常: {str(e)}")
+        traceback.print_exc()
+        response = input("\n回测失败，是否继续运行策略? (y/n, 默认y): ").strip().lower()
+        return response != 'n'
 
 
 def main():
@@ -15667,7 +17969,7 @@ def main():
 
             logger.info(f"   精度: {symbol_info['digits']}位")
 
-        # 初始化并运行策略
+        # 初始化策略组件
 
         logger.info("🚀 初始化策略组件...")
 
@@ -15677,10 +17979,36 @@ def main():
 
         logger.info("✅ 所有组件初始化完成")
 
+        # 询问是否先回测
+        logger.info("\n" + "=" * 60)
+        logger.info("📊 回测选项")
+        logger.info("=" * 60)
+        logger.info("是否在运行策略前先进行回测验证？")
+        logger.info("回测将使用最近30天的历史数据验证策略表现")
+
+        try:
+            backtest_choice = input("\n是否先回测? (y/n, 默认y): ").strip().lower()
+            if backtest_choice == '':
+                backtest_choice = 'y'
+        except (EOFError, KeyboardInterrupt):
+            backtest_choice = 'y'  # 默认回测
+
+        if backtest_choice == 'y':
+            # 执行回测
+            continue_strategy = run_backtest_before_strategy(strategy, valid_symbol, backtest_days=30)
+
+            if not continue_strategy:
+                logger.info("用户选择不继续运行策略")
+                return
+
+            logger.info("\n" + "=" * 60)
+            logger.info("✅ 回测完成，准备启动实盘策略")
+            logger.info("=" * 60)
+            time.sleep(2)  # 给用户2秒时间查看回测结果
+
+        logger.info("\n" + "=" * 60)
         logger.info("📈 开始运行策略...")
-
         logger.info("💡 按 Ctrl+C 停止策略")
-
         logger.info("=" * 60)
 
         # 运行策略
